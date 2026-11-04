@@ -869,6 +869,19 @@
     padding:0; border-radius:50%; color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,var(--surface));
     border-color:color-mix(in srgb,var(--accent) 30%,var(--border)); }
   .patrolrouteplay svg{ width:18px; height:18px; }
+  #patrol_list .patrolcard.unavailable{ opacity:.38; filter:grayscale(1); }
+  #patrol_list .patrolcard.running{ border-color:color-mix(in srgb,var(--accent) 35%,var(--border)); }
+  .patrolrouteinfo:disabled{ cursor:default; }
+  .patrolrouteprogress{ flex:1; min-width:0; text-align:center; font-size:12px; color:var(--accent); overflow-wrap:anywhere; }
+  .patrolrouteprogress.err{ color:var(--danger); }
+  .patrolcard .patrolrouteplay.stopping{ color:var(--danger);
+    background:color-mix(in srgb,var(--danger) 10%,var(--surface)); border-color:color-mix(in srgb,var(--danger) 35%,var(--border)); }
+  @media (max-width:480px){
+    #patrol_list .patrolcard.running{ display:grid; grid-template-columns:minmax(0,1fr) 42px; column-gap:12px; row-gap:6px; }
+    #patrol_list .running .patrolrouteinfo{ grid-column:1; grid-row:1; }
+    #patrol_list .running .patrolrouteprogress{ grid-column:1; grid-row:2; text-align:left; }
+    #patrol_list .running .patrolrouteplay{ grid-column:2; grid-row:1 / 3; }
+  }
   #patrol_delete{ display:block; margin:10px auto 0; min-height:40px; padding:8px 12px; border:0;
     background:transparent; color:var(--danger); font-size:12px; }
   .patrolsteps:empty{ display:none; }
@@ -9742,6 +9755,6 @@ setInterval(()=>{ if(!document.hidden&&curTab==="clean"&&wsLive()) refreshState(
     </div>
   </div>
 </div>
-<script src="/static/patrol.js?v=9"></script>
+<script src="/static/patrol.js?v=10"></script>
 </body>
 </html>

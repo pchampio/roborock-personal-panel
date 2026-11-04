@@ -4,7 +4,8 @@ let patrolMap=null, patrolRoutes=[], patrolSteps=[], patrolId=null, patrolEditin
 let patrolRun=null, patrolRemote={active:false}, patrolPending=false, patrolStartRequest=null;
 let patrolTimer=null, patrolEpoch=0, patrolMapReady=false;
 let patrolView="saved";
-const patrolBusy=()=>patrolPending || !!patrolRun || !!patrolRemote.active;
+let patrolRouteId=null, patrolStopping=false;
+const patrolBusy=()=>patrolPending || patrolStopping || !!patrolRun || !!patrolRemote.active;
 function patrolEditorNote(text,error=false){
   $("patrol_editor_status").textContent=error?text.replace(/^\d{3}[:\s]+/,""):text;
   $("patrol_editor_status").classList.toggle("err",error);
@@ -12,6 +13,7 @@ function patrolEditorNote(text,error=false){
 function patrolNote(text,error=false){
   $("patrol_status").textContent=text; $("patrol_status").classList.toggle("err",error);
   if(patrolEditing)patrolEditorNote(text,error);
+  patrolSyncCards();
 }
 function patrolMode(mode,force=false){
   if(patrolBusy() && !force) return;
@@ -30,11 +32,39 @@ function patrolMode(mode,force=false){
     $("patrol_"+tab).setAttribute("aria-pressed",String(selected));
   }
   $("patrol_hint").textContent=editing ? "Touchez la carte pour ajouter les destinations dans l’ordre, puis ajoutez des rotations ou des pauses." : "Touchez un point sur la carte pour y aller. La caméra reste ouverte à l’arrivée.";
-  patrolDraw(); patrolRenderSteps();
+  patrolDraw(); patrolRenderSteps();patrolSyncCards();
+}
+function patrolSyncCards(){
+  const busy=patrolBusy(), status=$("patrol_status");
+  // Older sessions expose the name only. Match it only when unambiguous so a
+  // refreshed page never puts Stop on the wrong card.
+  const matching=patrolRoutes.filter(r=>r.name===patrolRemote.name);
+  const observedId=!patrolRun && !patrolPending && patrolRemote.active && matching.length===1?matching[0].id:null;
+  const activeId=busy?(patrolRouteId || observedId):null;
+  let inline=false;
+  $("patrol_list").querySelectorAll(".patrolcard").forEach(row=>{
+    const active=row.dataset.id===activeId;
+    const info=row.querySelector(".patrolrouteinfo"), play=row.querySelector(".patrolrouteplay");
+    const progress=row.querySelector(".patrolrouteprogress"), detail=info.querySelector("small");
+    row.classList.toggle("running",active);row.classList.toggle("unavailable",busy&&!active);
+    info.disabled=busy || info.dataset.wrongMap==="1";
+    detail.textContent=active?row.dataset.steps:row.dataset.detail;
+    progress.hidden=!active;progress.textContent=active?status.textContent:"";
+    progress.classList.toggle("err",status.classList.contains("err"));
+    play.classList.toggle("stopping",active);
+    play.disabled=active?patrolStopping:(busy || !patrolMapReady || play.dataset.wrongMap==="1");
+    play.title=active?"Arrêter le parcours":`Lancer ${row.dataset.name}`;
+    play.setAttribute("aria-label",play.title);
+    play.innerHTML=active
+      ? '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>';
+    if(active && patrolView==="saved")inline=true;
+  });
+  status.hidden=inline;
+  $("patrol_stop").hidden=!busy || inline;
 }
 function patrolSync(){
   const busy=patrolBusy();
-  $("patrol_stop").hidden=!busy;
   $("rc_arm").disabled=busy;
   $("ch_menu").disabled=busy;
   $("rc_halt").classList.toggle("live",busy || rcOn);
@@ -47,7 +77,7 @@ function patrolSync(){
   $("patrol_delete").hidden=!patrolId;
   $("patrol_delete").disabled=busy;
   $("patrol_home").disabled=busy || !patrolMapReady || patrolSteps.some(s=>s.kind==="home");
-  $("patrol_list").querySelectorAll("button").forEach(b=>b.disabled=busy || b.dataset.wrongMap==="1");
+  patrolSyncCards();
 }
 function patrolPointToMap(p){
   const m=patrolMap, [ox,oy]=m.origin;
@@ -117,11 +147,13 @@ function patrolRenderList(){
   if(!patrolRoutes.length){const p=document.createElement("p");p.className="patrolhint";p.textContent="Aucun parcours enregistré.";list.append(p);}
   for(const r of patrolRoutes){
     const row=document.createElement("div");row.className="patrolcard";
+    row.dataset.id=r.id;row.dataset.name=r.name;
     const wrong=patrolMap && r.map_flag!==patrolMap.map_flag;
     const info=document.createElement("button");info.className="patrolrouteinfo";
     info.setAttribute("aria-label",`Modifier le parcours ${r.name}`);info.dataset.wrongMap=wrong?"1":"0";
     const name=document.createElement("strong");name.textContent=r.name;
     const detail=document.createElement("small");detail.textContent=`${r.steps.length} étape${r.steps.length===1?"":"s"} · ${wrong?"Autre carte":"Modifier"}`;
+    row.dataset.steps=`${r.steps.length} étape${r.steps.length===1?"":"s"}`;row.dataset.detail=detail.textContent;
     info.append(name,detail);
     info.onclick=()=>{
       if(patrolBusy() || wrong)return;
@@ -131,8 +163,13 @@ function patrolRenderList(){
     const play=document.createElement("button");play.className="btn sm patrolrouteplay";
     play.title=`Lancer ${r.name}`;play.setAttribute("aria-label",play.title);play.dataset.wrongMap=wrong?"1":"0";
     play.innerHTML='<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>';
-    play.onclick=()=>{if(!patrolBusy() && !wrong)patrolStart({id:r.id},r.steps);};
-    row.append(info,play);list.append(row);
+    const progress=document.createElement("span");progress.className="patrolrouteprogress";
+    progress.hidden=true;progress.setAttribute("role","status");
+    play.onclick=()=>{
+      if(row.classList.contains("running")){if(!patrolStopping)patrolStopSession();}
+      else if(!patrolBusy() && !wrong)patrolStart({id:r.id},r.steps);
+    };
+    row.append(info,progress,play);list.append(row);
   }
   patrolSync();
 }
@@ -156,12 +193,12 @@ async function patrolOpen(){
     }
     patrolMap=next;patrolMap.image="/api/map.png?t="+Date.now();
     patrolMapReady=true;await patrolLoadRoutes();patrolDraw();
-    patrolNote(patrolRemote.active?"Un parcours est déjà en cours.":"");patrolSync();
+    patrolNote(patrolRemote.active?(patrolRemote.message||"Un parcours est déjà en cours."):"");patrolSync();
   }catch(e){patrolNote(e.message,true);}
 }
 async function patrolStart(body,steps){
   if(patrolBusy() || !patrolMapReady)return;
-  const epoch=++patrolEpoch;patrolPending=true;patrolSync();patrolNote("Démarrage…");
+  const epoch=++patrolEpoch;patrolPending=true;patrolRouteId=body.id||null;patrolSync();patrolNote("Démarrage…");
   let req=null;
   try{
     if(chPlayRun)await chPlayStop();await rcEnd();
@@ -172,7 +209,7 @@ async function patrolStart(body,steps){
     patrolRun={token:res.token,steps:structuredClone(steps)};patrolRemote=res;patrolNote(res.message);patrolDraw();
     patrolTimer=setTimeout(patrolPoll,1000);
   }catch(e){if(epoch===patrolEpoch)patrolNote(e.message,true);}
-  finally{if(patrolStartRequest===req)patrolStartRequest=null;patrolPending=false;patrolSync();}
+  finally{if(patrolStartRequest===req)patrolStartRequest=null;patrolPending=false;if(!patrolRun&&!patrolRemote.active)patrolRouteId=null;patrolSync();}
 }
 async function patrolPoll(){
   const run=patrolRun;
@@ -206,7 +243,7 @@ async function patrolPoll(){
       }
     }
     if(!st.active){
-      patrolRun=null;patrolSync();
+      patrolRun=null;patrolRouteId=null;patrolSync();
       if(st.camera_closed)camDetach();
       else if(st.end_session || st.phase!=="complete")await camStop();
       return;
@@ -215,6 +252,9 @@ async function patrolPoll(){
   }catch(e){if(patrolRun===run){await patrolStop();await camStop();patrolNote("Connexion perdue. Parcours arrêté.",true);}}
 }
 async function patrolStop(){
+  if(patrolStopping)return;
+  patrolStopping=true;patrolNote("Arrêt…");patrolSync();
+  try{
   ++patrolEpoch;clearTimeout(patrolTimer);patrolTimer=null;
   let token=patrolRun?.token;const hadRemote=patrolRemote.active;
   const pending=patrolStartRequest;
@@ -223,7 +263,7 @@ async function patrolStop(){
   if(!token && !hadRemote){patrolSync();return;}
   try{patrolRemote=await post("/api/patrol/session",{action:"stop",...(token?{token}:{})});patrolNote(patrolRemote.message);}
   catch(e){patrolRemote={active:false};patrolNote("Arrêt non confirmé. La session expire sans connexion.",true);}
-  patrolPending=false;patrolSync();
+  }finally{patrolPending=false;patrolStopping=false;patrolRouteId=null;patrolSync();}
 }
 let patrolPointer=null;
 $("patrol_map").addEventListener("pointerdown",e=>{patrolPointer={id:e.pointerId,x:e.clientX,y:e.clientY};});
@@ -270,7 +310,8 @@ $("patrol_delete").onclick=async()=>{
     patrolId=null;patrolSteps=[];$("patrol_name").value="";await patrolLoadRoutes();patrolRenderSteps();patrolDraw();patrolNote("Parcours supprimé.");
   }catch(e){patrolNote(e.message,true);}
 };
-$("patrol_stop").onclick=async()=>{stopClips();await patrolStop();await camStop();};
+async function patrolStopSession(){stopClips();await patrolStop();await camStop();}
+$("patrol_stop").onclick=patrolStopSession;
 // Keep manual driving mutually exclusive with route navigation.
 const patrolManualClick=$("rc_arm").onclick;
 $("rc_arm").onclick=async()=>{
