@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -21,6 +22,7 @@ class Robot:
         self.error = 0
         self.flag = 0
         self.manual = False
+        self.dock_approach = [1500, 1500]
 
     async def send(self, duid, method, params):
         self.calls.append((method, params))
@@ -44,6 +46,7 @@ class Robot:
             self.state = 8
         if position:
             result['position'] = self.pos
+            result['dock_approach'] = self.dock_approach
         return result
 
 
@@ -66,11 +69,11 @@ class Routes(unittest.IsolatedAsyncioTestCase):
         r=CameraRobot();p=self.runner(r)
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000},{'kind':'turn','degrees':90},
                                {'kind':'goto','x':3000,'y':1000},{'kind':'home'}],'scan')
-        await p.task
+        await self.finish(p)
         methods=[method for method,_ in r.calls]
         self.assertEqual(p.state['phase'],'complete')
         self.assertEqual(p.state['camera_revision'],1)
-        self.assertEqual(methods.count('app_goto_target'),2)
+        self.assertEqual(methods.count('app_goto_target'),3)
         self.assertLess(methods.index('stop_camera_preview'),methods.index('app_goto_target',1))
         self.assertIn('app_charge',methods)
 
@@ -83,7 +86,7 @@ class Routes(unittest.IsolatedAsyncioTestCase):
 
         r=FailedRobot();p=self.runner(r)
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000}],'failure')
-        await p.task
+        await self.finish(p)
         self.assertIn('Original navigation failure',p.state['message'])
         self.assertEqual(p.state['cleanup_errors'],['app_stop'])
 
@@ -95,7 +98,7 @@ class Routes(unittest.IsolatedAsyncioTestCase):
 
         r=LockedRobot();p=self.runner(r);p.UNLOCK_TIMEOUT=.005
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000}],'locked')
-        await p.task
+        await self.finish(p)
         self.assertEqual(p.state['phase'],'error')
         self.assertEqual([m for m,_ in r.calls],['app_stop','stop_camera_preview'])
 
@@ -124,26 +127,138 @@ class Routes(unittest.IsolatedAsyncioTestCase):
     async def test_waypoints_rotation_and_session_end(self):
         r=Robot();p=self.runner(r)
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000},{'kind':'turn','degrees':90},{'kind':'goto','x':3000,'y':1000}],'route')
-        await p.task
+        await self.finish(p)
         methods=[c[0] for c in r.calls]
         self.assertEqual(methods,['app_goto_target','app_rc_start','app_rc_move','app_rc_end','app_goto_target','stop_camera_preview'])
         self.assertEqual(p.state['phase'],'complete')
         self.assertEqual(r.calls[2][1][0]['velocity'],0)
 
-    async def test_home_is_last_and_closes_camera_after_docking(self):
+    async def ack_close(self, p):
+        while p.active and not p.state.get('camera_close_requested'):
+            await asyncio.sleep(.001)
+        if p.active:
+            p.camera_closed(p.token)
+
+    async def finish(self, p):
+        browser = asyncio.create_task(self.ack_close(p))
+        try:
+            await p.task
+        finally:
+            browser.cancel()
+            await asyncio.gather(browser, return_exceptions=True)
+
+    async def test_home_approaches_then_closes_session_before_docking(self):
         r=Robot();p=self.runner(r)
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000},{'kind':'home'}],'home')
-        await p.task
-        self.assertEqual([c[0] for c in r.calls],['app_goto_target','app_charge','stop_camera_preview'])
+        await self.finish(p)
+        self.assertEqual([c[0] for c in r.calls],['app_goto_target','app_goto_target','app_rc_end','stop_camera_preview','app_charge'])
+        self.assertEqual(r.calls[1][1],r.dock_approach)
         self.assertEqual(r.state,8)
+        self.assertTrue(p.state['camera_closed'])
         self.assertEqual(p.state['phase'],'complete')
 
     async def test_stop_while_returning_home(self):
-        r=Robot();r.arrive=False;p=self.runner(r)
+        class ReturningRobot(Robot):
+            async def send(self, duid, method, params):
+                if method=='app_charge': self.arrive=False
+                return await super().send(duid,method,params)
+        r=ReturningRobot();p=self.runner(r)
         token=await p.start('robot',0,[{'kind':'home'}],'home')
-        await asyncio.sleep(.005);await p.stop(token)
-        self.assertEqual([c[0] for c in r.calls],['app_charge','app_stop','stop_camera_preview'])
+        await self.ack_close(p)
+        while r.state!=6: await asyncio.sleep(.001)
+        await p.stop(token)
+        self.assertEqual([c[0] for c in r.calls],['app_goto_target','app_rc_end','stop_camera_preview','app_charge','app_stop'])
         self.assertEqual(p.state['phase'],'stopped')
+
+    async def test_docking_waits_for_browser_acknowledgement(self):
+        r=Robot();r.pos=r.dock_approach;p=self.runner(r)
+        token=await p.start('robot',0,[{'kind':'home'}],'home')
+        await asyncio.sleep(.005)
+        self.assertTrue(p.state['camera_close_requested'])
+        self.assertEqual(r.calls,[])
+        with self.assertRaises(ValueError):p.camera_closed('stale')
+        self.assertFalse(p.browser_closed.is_set())
+        p.camera_closed(token)
+        await p.task
+        self.assertEqual([m for m,_ in r.calls],['app_rc_end','stop_camera_preview','app_charge'])
+
+    async def test_docking_waits_for_robot_video_shutdown(self):
+        class ClosingRobot(Robot):
+            closing=0
+            async def send(self,duid,method,params):
+                if method=='stop_camera_preview': self.closing=3
+                if method=='app_charge': self.assert_closed=self.closing==0
+                return await super().send(duid,method,params)
+            async def snapshot(self,duid,position):
+                st=await super().snapshot(duid,position)
+                st['home_sec_status']=int(self.closing>0)
+                self.closing=max(0,self.closing-1)
+                return st
+        r=ClosingRobot();p=self.runner(r)
+        await p.start('robot',0,[{'kind':'home'}],'home')
+        await self.finish(p)
+        self.assertTrue(r.assert_closed)
+        self.assertEqual(p.state['phase'],'complete')
+
+    async def test_missing_browser_ack_never_docks(self):
+        r=Robot();p=self.runner(r);p.CLOSE_TIMEOUT=.005
+        await p.start('robot',0,[{'kind':'home'}],'home')
+        await p.task
+        self.assertEqual(p.state['phase'],'error')
+        self.assertNotIn('app_charge',[m for m,_ in r.calls])
+        self.assertIn('stop_camera_preview',[m for m,_ in r.calls])
+
+    async def test_failed_remote_shutdown_never_docks(self):
+        for failed in ('app_rc_end','stop_camera_preview'):
+            class BrokenRobot(Robot):
+                async def send(self,duid,method,params):
+                    if method==failed: raise ValueError('shutdown refused')
+                    return await super().send(duid,method,params)
+            r=BrokenRobot();p=self.runner(r)
+            await p.start('robot',0,[{'kind':'home'}],'home')
+            await self.finish(p)
+            self.assertEqual(p.state['phase'],'error')
+            self.assertNotIn('app_charge',[m for m,_ in r.calls])
+
+    async def test_remote_status_still_active_never_docks(self):
+        class StuckCamera(Robot):
+            async def snapshot(self,duid,position):
+                return {**await super().snapshot(duid,position),'home_sec_status':1}
+        r=StuckCamera();p=self.runner(r);p.UNLOCK_TIMEOUT=.005
+        await p.start('robot',0,[{'kind':'home'}],'home')
+        await self.finish(p)
+        self.assertEqual(p.state['phase'],'error')
+        self.assertNotIn('app_charge',[m for m,_ in r.calls])
+
+    async def test_no_dock_coordinates_never_guesses_a_destination(self):
+        r=Robot();r.dock_approach=None;p=self.runner(r)
+        await p.start('robot',0,[{'kind':'home'}],'home')
+        await self.finish(p)
+        self.assertEqual(p.state['phase'],'error')
+        self.assertEqual([m for m,_ in r.calls],['stop_camera_preview'])
+
+    async def test_failed_approach_never_docks(self):
+        r=Robot();r.arrive=False;p=self.runner(r)
+        await p.start('robot',0,[{'kind':'home'}],'home')
+        await self.finish(p)
+        self.assertEqual(p.state['phase'],'error')
+        self.assertEqual([m for m,_ in r.calls],['app_goto_target','app_stop','stop_camera_preview'])
+
+    async def test_cancel_during_shutdown_never_docks(self):
+        r=Robot();r.pos=r.dock_approach;p=self.runner(r)
+        token=await p.start('robot',0,[{'kind':'home'}],'home')
+        await asyncio.sleep(.005)
+        await p.stop(token)
+        self.assertEqual(p.state['phase'],'stopped')
+        self.assertNotIn('app_charge',[m for m,_ in r.calls])
+
+    async def test_already_docked_closes_without_moving(self):
+        r=Robot();r.state=8;p=self.runner(r)
+        await p.start('robot',0,[{'kind':'home'}],'home',False)
+        await self.finish(p)
+        self.assertEqual([m for m,_ in r.calls],['app_rc_end','stop_camera_preview'])
+        self.assertTrue(p.state['end_session'])
+        self.assertEqual(p.state['phase'],'complete')
 
     async def test_stop_during_travel_cannot_advance(self):
         r=Robot();r.arrive=False;p=self.runner(r)
@@ -156,7 +271,7 @@ class Routes(unittest.IsolatedAsyncioTestCase):
     async def test_failed_arrival_cannot_rotate(self):
         r=Robot();r.arrive=False;p=self.runner(r)
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000},{'kind':'turn','degrees':90}],'route')
-        await p.task
+        await self.finish(p)
         self.assertEqual(p.state['phase'],'error')
         self.assertNotIn('app_rc_start',[c[0] for c in r.calls])
         self.assertIn('app_stop',[c[0] for c in r.calls])
@@ -164,14 +279,14 @@ class Routes(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_stops_session(self):
         r=Robot();r.arrive=False;p=self.runner(r);p.LEASE=-1
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000}],'route')
-        await p.task
+        await self.finish(p)
         self.assertEqual(p.state['phase'],'error')
         self.assertIn('stop_camera_preview',[c[0] for c in r.calls])
 
     async def test_tap_arrival_keeps_camera(self):
         r=Robot();p=self.runner(r)
         await p.start('robot',0,[{'kind':'goto','x':2000,'y':1000}],'tap',False)
-        await p.task
+        await self.finish(p)
         self.assertEqual(p.state['phase'],'complete')
         self.assertNotIn('stop_camera_preview',[c[0] for c in r.calls])
 
@@ -222,5 +337,23 @@ class Storage(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.validate_steps([{'kind':'turn','degrees':90,'speed':speed}])
 
+
+
+class DockGeometry(unittest.TestCase):
+    def test_cardinal_directions_and_rotated_flipped_projection(self):
+        for angle,delta in [(0,[800,0]),(90,[0,800]),(180,[-800,0]),(-90,[0,-800])]:
+            dock=SimpleNamespace(x=25000,y=26000,a=angle)
+            proj=(lambda x,y:(x/512,y/512),512,512)
+            result=m.station_approach(dock,proj,lambda x,y:(x*100,y*100))
+            self.assertEqual(result,[25000+delta[0],26000+delta[1]])
+            # Rotate the rendered image and invert its Y axis; inverse calibration
+            # still yields the same native point.
+            proj=(lambda x,y:((51200-y)/512,x/512),512,512)
+            result=m.station_approach(dock,proj,lambda x,y:(y*100,51200-x*100))
+            self.assertEqual(result,[25000+delta[0],26000+delta[1]])
+    def test_missing_or_invalid_dock_is_rejected(self):
+        proj=(lambda x,y:(x,y),100,100)
+        for dock in [None,SimpleNamespace(x=0,y=0,a=None),SimpleNamespace(x=0,y=0,a=float('nan')),SimpleNamespace(x=0,y=0,a=180)]:
+            self.assertIsNone(m.station_approach(dock,proj,lambda x,y:(x,y)))
 
 if __name__=='__main__':unittest.main()

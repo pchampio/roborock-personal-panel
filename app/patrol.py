@@ -10,6 +10,30 @@ import secrets
 import time
 
 
+def station_approach(charger, projector, convert):
+    """A point 80 cm in front of the dock, in Tap & Go's native coordinates."""
+    angle = getattr(charger, "a", None)
+    if charger is None or angle is None or not projector or not convert:
+        return None
+    if not all(math.isfinite(float(n)) for n in (charger.x, charger.y, angle)):
+        return None
+    # Project two points so map rotation, scale and the optional Y flip agree
+    # with every other navigation command. This uses the dock's map heading,
+    # not live robot heading estimation or calibration.
+    a = math.radians(float(angle))
+    to_pct, w, h = projector
+    x0, y0 = to_pct(charger.x, charger.y)
+    x1, y1 = to_pct(charger.x + math.cos(a)*1000, charger.y + math.sin(a)*1000)
+    dock = convert(x0*w/100, y0*h/100)
+    front = convert(x1*w/100, y1*h/100)
+    dx, dy = front[0]-dock[0], front[1]-dock[1]
+    distance = math.hypot(dx, dy)
+    if not math.isfinite(distance) or distance <= 0:
+        return None
+    target = [round(dock[0]+800*dx/distance), round(dock[1]+800*dy/distance)]
+    return target if all(0 <= n <= 51200 for n in target) else None
+
+
 def validate_steps(value):
     if not isinstance(value, list) or not 1 <= len(value) <= 40:
         raise ValueError("Ajoutez entre 1 et 40 étapes.")
@@ -92,6 +116,7 @@ class Patrol:
     GOTO_TIMEOUT = 180.0
     HOME_TIMEOUT = 300.0
     UNLOCK_TIMEOUT = 8.0
+    CLOSE_TIMEOUT = 15.0
     POLL = 0.8
     PAIR_DELAY = 2.0
     OMEGA = 0.6
@@ -111,6 +136,7 @@ class Patrol:
         self.motion = None
         self.state = {"phase": "idle", "step": 0, "total": 0, "message": ""}
         self.lock = asyncio.Lock()
+        self.browser_closed = asyncio.Event()
 
     @property
     def active(self):
@@ -134,6 +160,7 @@ class Patrol:
                 if st["state"] not in self.IDLE or st.get("in_cleaning"):
                     raise ValueError("Arrêtez le nettoyage ou le pilotage avant de lancer un parcours.")
                 self.end_session = end_session
+                self.browser_closed.clear()
                 self.token = secrets.token_hex(16)
                 self.deadline = time.monotonic() + self.LEASE
                 self.state = {"phase": "running", "step": 0, "total": len(steps), "name": name,
@@ -148,6 +175,13 @@ class Patrol:
             raise ValueError("Session de déplacement expirée.")
         if self.active:
             self.deadline = time.monotonic() + self.LEASE
+        return self.status()
+
+    def camera_closed(self, token):
+        self.touch(token)
+        if not self.state.get("camera_close_requested"):
+            raise ValueError("Fermeture de la vidéo non demandée.")
+        self.browser_closed.set()
         return self.status()
 
     async def stop(self, token=None):
@@ -236,7 +270,46 @@ class Patrol:
                 raise ValueError("Déplacement interrompu. Parcours arrêté.")
         raise ValueError("Point non atteint après 3 minutes. Parcours arrêté.")
 
+    async def _close_remote(self):
+        # Let the owning browser stop its microphone, audio and WebRTC before
+        # shutting down the robot's session. It must not reconnect during docking.
+        self.state.update(camera_close_requested=True, message="Fermeture de la vidéo et du pilotage…")
+        try:
+            await asyncio.wait_for(self.browser_closed.wait(), self.CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ValueError("Fermeture de la vidéo non confirmée. Actualisez la page puis réessayez.") from None
+        self.motion = "turn"
+        await self._command("app_rc_end")
+        await self._command("stop_camera_preview", {"client_id": "676f32727463"})
+        deadline = time.monotonic() + self.UNLOCK_TIMEOUT
+        while time.monotonic() < deadline:
+            st = await self.snapshot(self.duid, False)
+            self._check(st)
+            if st["state"] in self.IDLE and not st.get("home_sec_status"):
+                self.motion = None
+                self.state["camera_closed"] = True
+                return
+            await asyncio.sleep(self.POLL)
+        raise ValueError("Le robot n’a pas confirmé la fermeture du pilotage et de la vidéo.")
+
     async def _home(self):
+        self.end_session = True
+        self.state["end_session"] = True
+        st = await self.snapshot(self.duid, True)
+        self._check(st)
+        docked = st["state"] in (8, 100)
+        if not docked:
+            target = st.get("dock_approach")
+            if not target:
+                raise ValueError("Point d’approche de la station indisponible sur la carte.")
+            self.state["message"] = "Approche de la station…"
+            pos = st.get("position")
+            if not pos or math.hypot(pos[0]-target[0], pos[1]-target[1]) > 350:
+                await self._goto({"x": target[0], "y": target[1]})
+        await self._close_remote()
+        if docked:
+            return
+        self.state["message"] = "Vidéo fermée · Retour à la station…"
         self.motion = "home"
         await self._navigation_command("app_charge")
         deadline = time.monotonic() + self.HOME_TIMEOUT
@@ -245,14 +318,14 @@ class Patrol:
             await asyncio.sleep(self.POLL)
             st = await self.snapshot(self.duid, False)
             self._check(st)
-            if st["state"] in (8, 100):
+            if st["state"] in (8, 100, 22, 23, 25):
                 self.motion = None
                 return
-            if st["state"] in (6, 15):
+            if st["state"] in (6, 15, 26, 6310):
                 continue
             if st["state"] in self.IDLE and time.monotonic()-started < 10:
                 continue
-            raise ValueError("Retour à la station interrompu.")
+            raise ValueError(f"Retour à la station interrompu (état {st['state']}).")
         raise ValueError("Station non atteinte après 5 minutes. Session arrêtée.")
 
     async def _turn(self, step):
@@ -296,7 +369,7 @@ class Patrol:
     async def _cleanup(self):
         failures = []
         commands = ["app_stop"] if self.motion in ("goto", "home") else ["app_rc_end"] if self.motion == "turn" else []
-        if self.end_session or self.state["phase"] != "complete":
+        if not self.state.get("camera_closed") and (self.end_session or self.state["phase"] != "complete"):
             commands.append("stop_camera_preview")
         for method in commands:
             try:

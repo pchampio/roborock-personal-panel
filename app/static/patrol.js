@@ -187,7 +187,16 @@ async function patrolPoll(){
     const st=await post("/api/patrol/session",{action:"heartbeat",token:run.token});
     if(patrolRun!==run)return;
     patrolRemote=st;patrolNote(st.message,st.phase==="error");
-    if(st.active && (st.camera_revision||0)>(run.cameraRevision||0)){
+    if(st.active && st.camera_close_requested && !run.cameraClosed){
+      // Local teardown only: camStop() also cancels the route. The server owns
+      // the robot-side shutdown and waits for this acknowledgement before docking.
+      camDetach();rcOn=false;rcKeys.clear();syncRcArm();
+      await post("/api/patrol/session",{action:"camera_closed",token:run.token});
+      if(patrolRun!==run)return;
+      run.cameraClosed=true;
+      camNote("Vidéo fermée pour le retour à la station.");
+    }
+    if(st.active && !st.camera_close_requested && (st.camera_revision||0)>(run.cameraRevision||0)){
       run.cameraRevision=st.camera_revision;
       if(camPc){
         camDetach();
@@ -198,7 +207,8 @@ async function patrolPoll(){
     }
     if(!st.active){
       patrolRun=null;patrolSync();
-      if(st.end_session || st.phase!=="complete")await camStop();
+      if(st.camera_closed)camDetach();
+      else if(st.end_session || st.phase!=="complete")await camStop();
       return;
     }
     patrolTimer=setTimeout(patrolPoll,2000);

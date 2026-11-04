@@ -6155,6 +6155,9 @@ def _b64_json(value: typing.Any) -> typing.Any:
 
 async def _cam_send(method: str, params: typing.Any = None) -> typing.Any:
     async with STATE._lock:
+        if (PATROL.active and PATROL.state.get("camera_close_requested")
+                and method in ("start_camera_preview", "start_voice_chat", "send_sdp_to_robot", "send_ice_to_robot")):
+            raise ValueError("La vidéo est fermée pour le retour à la station.")
         props = await STATE.props()
         cmd = props.command
         return await (cmd.send(method, params) if params is not None else cmd.send(method))
@@ -6608,6 +6611,9 @@ async def _patrol_snapshot(duid, position):
                 pct = _point_pct(proj[0], point)
                 if pct:
                     out["position"] = convert(pct[0]*proj[1]/100, pct[1]*proj[2]/100)
+            target = patrol_mod.station_approach(getattr(md, "charger", None), proj, convert)
+            if target:
+                out["dock_approach"] = target
         return out
 
 
@@ -6674,6 +6680,8 @@ async def handle_patrol_session(request):
             return web.json_response({"token": token, **PATROL.status()})
         if action == "heartbeat":
             return web.json_response(PATROL.touch(body.get("token")))
+        if action == "camera_closed":
+            return web.json_response(PATROL.camera_closed(body.get("token")))
         if action == "stop":
             result = await PATROL.stop(body.get("token"))
             _journal("patrol", {"action": "stop"})

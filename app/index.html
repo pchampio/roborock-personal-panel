@@ -5955,7 +5955,7 @@ $("dock_back").onclick=()=>$("docksheet").classList.remove("show");
 $("dock_close").onclick=()=>$("docksheet").classList.remove("show");
 
 /* --- remote control + camera -------------------------------------------- */
-let camPc=null, camIceT=null, camPin="", rcOn=false;
+let camPc=null, camIceT=null, camPin="", rcOn=false, camEpoch=0;
 let camAudioTx=null, camMic=null, camHear=false, camTalk=false;
 function camNote(t){ $("camnote").textContent=t||""; }
 function camState(s){ $("camview").dataset.state=s; if(typeof syncSoundButtons==="function") syncSoundButtons(); }
@@ -5968,12 +5968,14 @@ function camFirstFrame(pc){
   else v.addEventListener("playing",show,{once:true});
 }
 function camDetach(){
+  ++camEpoch;
   stopClips();
   clearInterval(camIceT); camIceT=null;
   if(camMic){ camMic.getTracks().forEach(t=>t.stop()); camMic=null; }
   camAudioTx=null; camHear=false; camTalk=false; camMicReady=false;
   syncVoiceButtons();
-  if(camPc){ try{ camPc.close(); }catch(_){} camPc=null; }
+  const oldPc=camPc;camPc=null;
+  if(oldPc){ try{ oldPc.close(); }catch(_){} }
   $("camvideo").srcObject=null; camState("off");
   // No start button: the pad IS the way in, so it comes back whenever the video stops.
   patShow(false);
@@ -5997,21 +5999,26 @@ async function camGetMic(){
   }catch(e){ camNoMic=true; toast("Micro indisponible : "+e.message,true); return null; }
 }
 async function camStart(){
+  if(typeof patrolRemote!=="undefined" && patrolRemote.active && patrolRemote.camera_close_requested)return;
+  const epoch=++camEpoch;
   if(!window.RTCPeerConnection){ camNote("Ce navigateur ne gère pas WebRTC."); return; }
   camState("connecting"); $("campin").hidden=true; camNote("Ouverture de la caméra…");
   try{
     let r;
     try{ r=await post("/api/camera/start", camPin?{pin:camPin}:{}); }
     catch(e){
+      if(epoch!==camEpoch)return;
       if(/code/i.test(e.message)){
         const wrong=!!camPin; camPin=""; patShow(wrong);
         camNote(wrong?"Schéma incorrect, réessayez.":""); camState("off"); return;
       }
       throw e;
     }
+    if(epoch!==camEpoch)return;
     if(!r.ice_servers.length) throw new Error("l'aspirateur n'a pas de relais TURN (amorçage caméra non fait)");
-    if(!camNoMic && !camMic) camMic=await camGetMic();
-    const mic=camNoMic?null:camMic;
+    const mic=camNoMic?null:(camMic || await camGetMic());
+    if(epoch!==camEpoch){if(mic && mic!==camMic)mic.getTracks().forEach(t=>t.stop());return;}
+    camMic=mic;
     syncVoiceButtons();
     const pc=camPc=new RTCPeerConnection({iceServers:r.ice_servers});
     // The browser's own codec list, untouched: trimming it with setCodecPreferences
@@ -6023,14 +6030,14 @@ async function camStart(){
     camAudioTx = mic
       ? pc.addTransceiver(mic.getAudioTracks()[0],{direction:"sendrecv",streams:[mic]})
       : pc.addTransceiver("audio",{direction:"recvonly"});
-    pc.ontrack=ev=>{ const v=$("camvideo"); if(!v.srcObject) v.srcObject=ev.streams[0]||new MediaStream([ev.track]);
+    pc.ontrack=ev=>{ if(camPc!==pc)return;const v=$("camvideo"); if(!v.srcObject) v.srcObject=ev.streams[0]||new MediaStream([ev.track]);
       if(ev.track.kind==="video") camFirstFrame(pc); };
     $("camvideo").onresize=$("camvideo").onloadedmetadata=()=>{
       const v=$("camvideo"); if(v.videoWidth && v.videoHeight) $("camview").style.aspectRatio=`${v.videoWidth}/${v.videoHeight}`;
     };
     let offered=false; const pending=[];
     const sendCand=c=>post("/api/camera/ice",{candidate:c.candidate,sdpMid:"0",sdpMLineIndex:0}).catch(()=>{});
-    pc.onicecandidate=ev=>{ if(!ev.candidate||!ev.candidate.candidate) return;
+    pc.onicecandidate=ev=>{ if(camPc!==pc || !ev.candidate||!ev.candidate.candidate) return;
       if(ev.candidate.component && ev.candidate.component!=="rtp") return;
       offered?sendCand(ev.candidate):pending.push(ev.candidate); };
     pc.onconnectionstatechange=()=>{
@@ -6042,10 +6049,12 @@ async function camStart(){
       else if(st==="failed"){ camNote("Connexion vidéo impossible : le relais TURN n'est pas joignable ?"); camStop(); }
     };
     await pc.setLocalDescription(await pc.createOffer());
+    if(epoch!==camEpoch)return;
     camNote("Connexion…");
     let ans;
     try{ ans=await post("/api/camera/offer",{sdp:pc.localDescription.sdp}); }
     catch(e){
+      if(epoch!==camEpoch)return;
       if(!mic || !/SDP|504/i.test(e.message)) throw e;
       // Unanswered with the microphone in it: once more without, for the session.
       camNoMic=true; mic.getTracks().forEach(t=>t.stop()); camMic=null;
@@ -6053,15 +6062,19 @@ async function camStart(){
       toast("L'aspirateur refuse l'audio : caméra sans micro.",true);
       return camStart();
     }
+    if(epoch!==camEpoch)return;
     offered=true; pending.splice(0).forEach(sendCand);
     await pc.setRemoteDescription({type:"answer",sdp:ans.sdp});
+    if(epoch!==camEpoch)return;
     // The microphone was only needed for the offer. Holding it puts Android in
     // call audio (earpiece / call volume), which takes 🔊 Son off the media
     // speaker, so let it go now; Parler swaps a fresh one into the same sender,
     // which needs no renegotiation once the audio line has been agreed.
     if(mic){
       try{ await camAudioTx.sender.replaceTrack(null); }catch(_){}
-      mic.getTracks().forEach(t=>t.stop()); camMic=null; camMicReady=true;
+      mic.getTracks().forEach(t=>t.stop());
+      if(epoch!==camEpoch)return;
+      camMic=null; camMicReady=true;
       syncVoiceButtons();
     }
     const seen=new Set(); let tries=0;
@@ -6073,7 +6086,7 @@ async function camStart(){
           try{ await pc.addIceCandidate({candidate:c.candidate,sdpMid:c.sdpMid??"0",sdpMLineIndex:c.sdpMLineIndex??0}); }catch(_){} } }catch(_){}
     };
     pull(); camIceT=setInterval(pull,1500);
-  }catch(e){ camNote("Caméra : "+e.message); if(camPc) camStop(); else { camState("off"); patShow(false); } }
+  }catch(e){ if(epoch!==camEpoch)return;camNote("Caméra : "+e.message); if(camPc) camStop(); else { camState("off"); patShow(false); } }
 }
 function syncVoiceButtons(){
   $("cam_sound").classList.toggle("on",camHear);
@@ -9729,6 +9742,6 @@ setInterval(()=>{ if(!document.hidden&&curTab==="clean"&&wsLive()) refreshState(
     </div>
   </div>
 </div>
-<script src="/static/patrol.js?v=8"></script>
+<script src="/static/patrol.js?v=9"></script>
 </body>
 </html>
