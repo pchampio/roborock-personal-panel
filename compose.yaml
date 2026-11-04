@@ -1,0 +1,25 @@
+services:
+  panel:
+    build: .
+    env_file: .env
+    environment:
+      RR_UI_HOST: 0.0.0.0
+      RR_UI_PORT: 8099
+      RR_RUNS_DB: /data/runs.json
+      RR_PRESETS_DB: /data/presets.json
+      RR_HISTORY_CACHE: /data/history_cache.json
+      RR_OBSTACLES_DB: /data/obstacles.json
+      RR_QUEUE_DB: /data/queue.json
+      RR_MOP_CARE_DB: /data/mop_care.json
+      RR_CHOREO_DB: /data/choreographies.json
+      RR_SOUNDS_DIR: /data/sounds
+      RR_LAUNCH_JOURNAL: /data/launches.jsonl
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8099}:8099"
+    volumes:
+      - panel-data:/data
+    restart: unless-stopped
+volumes:
+  panel-data:

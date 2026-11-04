@@ -1,0 +1,16 @@
+{
+  "python-roborock": {
+    "url": "https://github.com/Python-roborock/python-roborock.git",
+    "revision": "e8d546615720d7792788378f49bf292c3f0e499c",
+    "patches": [
+      "patches/python-roborock/0001-panel-client-support.patch"
+    ]
+  },
+  "local-roborock-server": {
+    "url": "https://github.com/Python-roborock/local_roborock_server.git",
+    "revision": "206d560f622836fc0a58f221e042858c475564cc",
+    "patches": [
+      "patches/local-roborock-server/0001-optional-cloudflare-turn.patch"
+    ]
+  }
+}

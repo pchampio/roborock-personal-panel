@@ -1,0 +1,18 @@
+# Local configuration and robot data
+.env
+.env.*
+!.env.example
+.deps/
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+app/*.json
+app/*.jsonl*
+app/*.tmp
+app/sounds/
+app/*_photos/
+app/*.png
+app/*.jpg

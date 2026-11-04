@@ -1,0 +1,344 @@
+diff --git a/src/roborock_local_server/bundled_backend/https_server/routes/fw/createca.py b/src/roborock_local_server/bundled_backend/https_server/routes/fw/createca.py
+index 12a120f..dc7b500 100644
+--- a/src/roborock_local_server/bundled_backend/https_server/routes/fw/createca.py
++++ b/src/roborock_local_server/bundled_backend/https_server/routes/fw/createca.py
+@@ -31,12 +31,16 @@ running a TURN server.
+ 
+ from __future__ import annotations
+ 
++import logging
+ from typing import Any
+ 
++from shared import cloudflare_turn
+ from shared.context import ServerContext
+ 
+ from ..bootstrap.catchall import build as _build_catchall
+ 
++_LOG = logging.getLogger(__name__)
++
+ # The firmware posts to this path on the iot/fwapi host; accept common prefixes.
+ _MATCH_SUFFIX = "/fwapi/createca"
+ 
+@@ -69,6 +73,8 @@ def build(
+     body_params: dict[str, list[str]],
+     clean_path: str,
+ ) -> dict[str, Any]:
++    if getattr(ctx, "turn_mode", "") == "cloudflare":
++        return _build_cloudflare(ctx, query_params, body_params, clean_path)
+     if not getattr(ctx, "turn_enabled", False) or not getattr(ctx, "turn_host", ""):
+         # No TURN server configured -> keep prior behaviour (camera unavailable).
+         return _build_catchall(ctx, query_params, body_params, clean_path)
+@@ -81,3 +87,45 @@ def build(
+         ttl=ctx.turn_ttl,
+     )
+     return {"code": 200, "msg": "success", "data": payload, "result": payload}
++
++
++def _build_cloudflare(
++    ctx: ServerContext,
++    query_params: dict[str, list[str]],
++    body_params: dict[str, list[str]],
++    clean_path: str,
++) -> dict[str, Any]:
++    """The same contract, with a relay and login minted by Cloudflare's TURN API.
++
++    `url` is the plain UDP form the firmware is known to use, and `urls` keeps
++    upstream's two-entry shape. Without a key configured -- or with the API unreachable -- this is
++    the catchall, exactly as when TURN is disabled.
++    """
++    key_id = getattr(ctx, "turn_cloudflare_key_id", "")
++    token = getattr(ctx, "turn_cloudflare_api_token", "")
++    if not key_id or not token:
++        _LOG.warning("createca: turn.mode is cloudflare but no TURN key is configured")
++        return _build_catchall(ctx, query_params, body_params, clean_path)
++    try:
++        servers = cloudflare_turn.ice_servers(key_id, token, ctx.turn_ttl)
++        url = cloudflare_turn.robot_url(servers["urls"])
++    except Exception as exc:  # noqa: BLE001 -- the camera is optional, the request is not
++        _LOG.warning("createca: Cloudflare TURN credentials unavailable: %s", exc)
++        return _build_catchall(ctx, query_params, body_params, clean_path)
++    # Upstream's exact shape -- one turn:, one stun: -- rather than all nine of
++    # Cloudflare's: the Saros 10R answered -10014 "request turnserver failed" to
++    # the 1.5 KB reply that carried the full list.
++    stun = next((u.split("?", 1)[0] for u in servers["urls"] if u.startswith("stun:")
++                 and u.split("?", 1)[0].endswith(":3478")), None)
++    urls = [url] + ([stun] if stun else [])
++    payload = {
++        "url": url,
++        "user": servers["username"],
++        "pwd": servers["credential"],
++        "ttl": ctx.turn_ttl,
++        "urls": urls,
++        "username": servers["username"],
++        "credential": servers["credential"],
++        "realm": "turn.cloudflare.com",
++    }
++    return {"code": 200, "msg": "success", "data": payload, "result": payload}
+diff --git a/src/roborock_local_server/bundled_backend/shared/cloudflare_turn.py b/src/roborock_local_server/bundled_backend/shared/cloudflare_turn.py
+new file mode 100644
+index 0000000..1beb98e
+--- /dev/null
++++ b/src/roborock_local_server/bundled_backend/shared/cloudflare_turn.py
+@@ -0,0 +1,94 @@
++"""Short-lived TURN credentials from Cloudflare Realtime (TURN service).
++
++Cloudflare's relay takes no static login: each set of credentials is minted by
++its API for a TTL, from a TURN key (id + API token) created in the dashboard.
++The robot asks for its relay through /fwapi/createca on every preview start, so
++credentials are cached and only re-minted once most of the TTL has gone -- the
++API is never in the path of more than the first request of a while.
++
++The point of using it: both the robot and the viewer connect OUT to the relay,
++so nothing has to be reachable from the internet on this side at all.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import threading
++import time
++import urllib.request
++from typing import Any
++from urllib.parse import urlsplit
++
++LOG = logging.getLogger(__name__)
++
++API_URL = "https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}/credentials/generate-ice-servers"
++TIMEOUT_SECONDS = 8
++# Re-mint once this fraction of the TTL has passed, so a robot that fetched near
++# the end of a cache window still holds credentials valid for a whole session.
++REFRESH_FRACTION = 0.5
++
++_lock = threading.Lock()
++_cache: dict[str, Any] = {"key": None, "at": 0.0, "ttl": 0, "servers": None}
++
++
++def _fetch(key_id: str, api_token: str, ttl: int) -> dict[str, Any]:
++    request = urllib.request.Request(
++        API_URL.format(key_id=key_id),
++        data=json.dumps({"ttl": ttl}).encode(),
++        # Cloudflare's edge answers 403 to urllib's default "Python-urllib/x.y".
++        headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json",
++                 "User-Agent": "roborock-local-server"},
++        method="POST",
++    )
++    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
++        payload = json.loads(response.read(65536))
++    servers = payload.get("iceServers") if isinstance(payload, dict) else None
++    # The API has answered both as one object and as a list of them.
++    if isinstance(servers, dict):
++        servers = [servers]
++    if not isinstance(servers, list) or not servers:
++        raise ValueError("Cloudflare TURN answered without iceServers")
++    urls: list[str] = []
++    username = credential = ""
++    for server in servers:
++        if not isinstance(server, dict):
++            continue
++        entry = server.get("urls")
++        urls += [entry] if isinstance(entry, str) else [u for u in (entry or []) if isinstance(u, str)]
++        if server.get("username") and not username:
++            username, credential = str(server["username"]), str(server.get("credential") or "")
++    if not username:
++        raise ValueError("Cloudflare TURN answered without credentials")
++    return {"urls": urls, "username": username, "credential": credential}
++
++
++def ice_servers(key_id: str, api_token: str, ttl: int) -> dict[str, Any]:
++    """{urls, username, credential}, cached for REFRESH_FRACTION of the TTL."""
++    cache_key = (key_id, api_token, ttl)
++    with _lock:
++        fresh = (_cache["key"] == cache_key and _cache["servers"] is not None
++                 and time.time() - _cache["at"] < _cache["ttl"] * REFRESH_FRACTION)
++        if fresh:
++            return _cache["servers"]
++        servers = _fetch(key_id, api_token, ttl)
++        _cache.update(key=cache_key, at=time.time(), ttl=ttl, servers=servers)
++        LOG.info("Cloudflare TURN credentials minted (ttl %ss, %d urls)", ttl, len(servers["urls"]))
++        return servers
++
++
++def robot_url(urls: list[str]) -> str:
++    """The one address the robot gets: plain UDP TURN on a standard port.
++
++    The only form proven with this firmware is upstream's `turn:host:port` -- a
++    Saros 10R handed turns: gathered no relay at all -- so the query string is
++    dropped and port 53 (offered by Cloudflare for restrictive networks) avoided.
++    """
++    plain = [u for u in urls if u.startswith("turn:")]
++    udp = [u for u in plain if "transport=tcp" not in u]
++    for url in udp + plain:
++        base = url.split("?", 1)[0]
++        port = urlsplit("//" + base.split(":", 1)[1]).port
++        if port != 53:
++            return base
++    raise ValueError("Cloudflare TURN offered no turn: url")
+diff --git a/src/roborock_local_server/bundled_backend/shared/context.py b/src/roborock_local_server/bundled_backend/shared/context.py
+index 69dc72c..c17c6d7 100644
+--- a/src/roborock_local_server/bundled_backend/shared/context.py
++++ b/src/roborock_local_server/bundled_backend/shared/context.py
+@@ -79,6 +79,9 @@ class ServerContext:
+     turn_password: str = ""
+     turn_realm: str = ""
+     turn_ttl: int = 86400
++    turn_mode: str = "disabled"
++    turn_cloudflare_key_id: str = ""
++    turn_cloudflare_api_token: str = ""
+     _bootstrap_encryptor: BootstrapEncryptor | None = field(init=False, default=None, repr=False)
+     _device_key_cache: DeviceKeyCache | None = field(init=False, default=None, repr=False)
+ 
+diff --git a/src/roborock_local_server/config.py b/src/roborock_local_server/config.py
+index 1469631..5ea6f0d 100644
+--- a/src/roborock_local_server/config.py
++++ b/src/roborock_local_server/config.py
+@@ -102,6 +102,8 @@ class TurnConfig:
+     password: str = ""
+     realm: str = ""
+     ttl: int = 86400
++    cloudflare_key_id: str = ""
++    cloudflare_api_token: str = ""
+ 
+ 
+ @dataclass(frozen=True)
+@@ -367,6 +369,8 @@ def load_config(path: str | Path) -> AppConfig:
+             password=str(turn.get("password", "")).strip(),
+             realm=str(turn.get("realm", "") or turn.get("host", "")).strip(),
+             ttl=_as_int(turn.get("ttl"), "turn.ttl", 86400),
++            cloudflare_key_id=str(turn.get("cloudflare_key_id", "")).strip(),
++            cloudflare_api_token=str(turn.get("cloudflare_api_token", "")).strip(),
+         ),
+     )
+ 
+@@ -378,9 +382,11 @@ def load_config(path: str | Path) -> AppConfig:
+     if config.broker.mode == "external":
+         _require_non_empty(config.broker.host, "broker.host")
+ 
+-    if config.turn.mode not in {"disabled", "provided", "external"}:
+-        raise ValueError("turn.mode must be 'disabled', 'provided', or 'external'")
+-    if config.turn.mode != "disabled":
++    if config.turn.mode not in {"disabled", "provided", "external", "cloudflare"}:
++        raise ValueError("turn.mode must be 'disabled', 'provided', 'external', or 'cloudflare'")
++    if config.turn.mode == "cloudflare" and config.turn.ttl <= 0:
++        raise ValueError("turn.ttl must be greater than 0")
++    if config.turn.mode in {"provided", "external"}:
+         _require_non_empty(config.turn.host, "turn.host")
+         _require_non_empty(config.turn.username, "turn.username")
+         _require_non_empty(config.turn.password, "turn.password")
+diff --git a/src/roborock_local_server/server.py b/src/roborock_local_server/server.py
+index 105a2aa..30d2191 100644
+--- a/src/roborock_local_server/server.py
++++ b/src/roborock_local_server/server.py
+@@ -483,6 +483,9 @@ class ReleaseSupervisor:
+             turn_password=self.config.turn.password,
+             turn_realm=self.config.turn.realm or self.config.turn.host or self.config.network.stack_fqdn,
+             turn_ttl=self.config.turn.ttl,
++            turn_mode=self.config.turn.mode,
++            turn_cloudflare_key_id=self.config.turn.cloudflare_key_id,
++            turn_cloudflare_api_token=self.config.turn.cloudflare_api_token,
+         )
+         self.endpoint_rules = default_endpoint_rules()
+         self.app = self._create_app()
+diff --git a/tests/test_cloudflare_turn.py b/tests/test_cloudflare_turn.py
+new file mode 100644
+index 0000000..4cbac93
+--- /dev/null
++++ b/tests/test_cloudflare_turn.py
+@@ -0,0 +1,97 @@
++"""``turn.mode = "cloudflare"``: createca hands out credentials minted by Cloudflare."""
++
++from __future__ import annotations
++
++import dataclasses
++
++import pytest
++
++import roborock_local_server.backend as backend  # noqa: F401 -- puts bundled_backend on sys.path
++from shared import cloudflare_turn  # noqa: E402
++
++from test_fw_createca import _make_context, _resolve
++
++CF_URLS = [
++    "stun:stun.cloudflare.com:3478",
++    "stun:stun.cloudflare.com:53",
++    "turn:turn.cloudflare.com:3478?transport=udp",
++    "turn:turn.cloudflare.com:53?transport=udp",
++    "turn:turn.cloudflare.com:3478?transport=tcp",
++    "turns:turn.cloudflare.com:5349?transport=tcp",
++    "turns:turn.cloudflare.com:443?transport=tcp",
++]
++
++
++@pytest.fixture(autouse=True)
++def _clear_cache():
++    cloudflare_turn._cache.update(key=None, at=0.0, ttl=0, servers=None)
++    yield
++
++
++def _cf_context(tmp_path, *, key_id="kid", token="tok"):
++    ctx = _make_context(tmp_path, turn_enabled=True)
++    return dataclasses.replace(ctx, turn_mode="cloudflare", turn_cloudflare_key_id=key_id,
++                               turn_cloudflare_api_token=token)
++
++
++def test_robot_url_is_plain_udp_without_query_and_never_port_53():
++    assert cloudflare_turn.robot_url(CF_URLS) == "turn:turn.cloudflare.com:3478"
++    assert cloudflare_turn.robot_url(["turn:t.example:53?transport=udp",
++                                      "turn:t.example:3478?transport=tcp"]) == "turn:t.example:3478"
++
++
++def test_createca_serves_cloudflare_credentials_and_caches_them(tmp_path, monkeypatch):
++    calls = []
++
++    def fake_fetch(key_id, api_token, ttl):
++        calls.append((key_id, api_token, ttl))
++        return {"urls": CF_URLS, "username": "cf-user", "credential": "cf-pass"}
++
++    monkeypatch.setattr(cloudflare_turn, "_fetch", fake_fetch)
++    ctx = _cf_context(tmp_path)
++
++    route_name, payload = _resolve(ctx, "/iot.roborock.com/fwapi/createca")
++    _resolve(ctx, "/iot.roborock.com/fwapi/createca")
++
++    assert route_name == "fw_createca"
++    data = payload["data"]
++    assert data["url"] == "turn:turn.cloudflare.com:3478"
++    assert data["urls"] == ["turn:turn.cloudflare.com:3478", "stun:stun.cloudflare.com:3478"]
++    assert data["user"] == data["username"] == "cf-user"
++    assert data["pwd"] == data["credential"] == "cf-pass"
++    assert payload["result"] == data
++    assert calls == [("kid", "tok", 86400)]          # second request served from cache
++
++
++def test_createca_falls_back_to_catchall_without_key_or_on_api_failure(tmp_path, monkeypatch):
++    def failing_fetch(*_args):
++        raise OSError("unreachable")
++
++    monkeypatch.setattr(cloudflare_turn, "_fetch", failing_fetch)
++    for ctx in (_cf_context(tmp_path, key_id=""), _cf_context(tmp_path)):
++        _route, payload = _resolve(ctx, "/iot.roborock.com/fwapi/createca")
++        assert "url" not in (payload.get("data") or {})
++
++
++def test_fetch_accepts_list_and_object_shapes(monkeypatch):
++    class Resp:
++        def __init__(self, body):
++            self.body = body
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def read(self, _n):
++            return self.body
++
++    import json
++    for shape in ({"urls": CF_URLS, "username": "u", "credential": "c"},
++                  [{"urls": CF_URLS[:2]}, {"urls": CF_URLS[2:], "username": "u", "credential": "c"}]):
++        monkeypatch.setattr(cloudflare_turn.urllib.request, "urlopen",
++                            lambda *_a, **_k: Resp(json.dumps({"iceServers": shape}).encode()))
++        got = cloudflare_turn._fetch("k", "t", 60)
++        assert got["username"] == "u" and got["credential"] == "c"
++        assert "turn:turn.cloudflare.com:3478?transport=udp" in got["urls"]

@@ -1,0 +1,614 @@
+diff --git a/roborock/data/v1/v1_clean_modes.py b/roborock/data/v1/v1_clean_modes.py
+index cc6345a..26ebb5e 100644
+--- a/roborock/data/v1/v1_clean_modes.py
++++ b/roborock/data/v1/v1_clean_modes.py
+@@ -56,6 +56,8 @@ class WaterModes(RoborockModeEnum):
+     EXTREME = ("extreme", 208)
+     SMART_MODE = ("smart_mode", 209)
+     PURE_WATER_FLOW_START = ("slight", 221)
++    PURE_WATER_FLOW_GENTLE = ("gentle", 230)
++    PURE_WATER_FLOW_MODERATE = ("moderate", 240)
+     PURE_WATER_FLOW_SMALL = ("low", 225)
+     PURE_WATER_FLOW_MIDDLE = ("medium", 235)
+     PURE_WATER_FLOW_LARGE = ("moderate", 245)
+@@ -91,12 +93,62 @@ WATER_SLIDE_MODE_MAPPING: dict[int, WaterModes] = {
+     200: WaterModes.OFF,
+     221: WaterModes.PURE_WATER_FLOW_START,
+     225: WaterModes.PURE_WATER_FLOW_SMALL,
++    230: WaterModes.PURE_WATER_FLOW_GENTLE,
+     235: WaterModes.PURE_WATER_FLOW_MIDDLE,
++    240: WaterModes.PURE_WATER_FLOW_MODERATE,
+     245: WaterModes.PURE_WATER_FLOW_LARGE,
+     248: WaterModes.PURE_WATER_SUPER_BEGIN,
+     250: WaterModes.PURE_WATER_FLOW_END,
+ }
+ 
++# --- water level slider -------------------------------------------------
++# Models with the pure-water-flow slider (confirmed on the Saros 10R,
++# roborock.vacuum.a144) do not pick from an enum: they send a level on a
++# 1..30 scale, encoded as WATER_LEVEL_BASE + level. The device UI groups
++# those levels into named bands.
++#
++# The band table comes from the Saros 10R app. It is corroborated by the
++# codes already in WATER_SLIDE_MODE_MAPPING for slight (221 -> 1), low
++# (225 -> 5), medium (235 -> 15) and extreme (250 -> 30); it also shows that
++# "gentle" and "moderate" had no entry at all, and that 245/248 were labelled
++# one band low (they are high/extreme, not moderate/high).
++WATER_LEVEL_BASE = 220
++WATER_LEVEL_MIN = 1
++WATER_LEVEL_MAX = 30
++# Bands carry their own name rather than borrowing the enum's string: the
++# existing members for 245 and 248 are labelled one band low ("moderate" and
++# "high" where the device means high and extreme), and they cannot simply be
++# renamed because a duplicate value would alias 248 onto EXTREME's code (208).
++WATER_LEVEL_BANDS: tuple[tuple[int, int, str], ...] = (
++    (1, 3, "slight"),
++    (4, 7, "low"),
++    (8, 12, "gentle"),
++    (13, 17, "medium"),
++    (18, 22, "moderate"),
++    (23, 27, "high"),
++    (28, 30, "extreme"),
++)
++
++
++def water_level_to_code(level: int) -> int:
++    """1..30 slider level -> the water_box_mode code to send."""
++    level = max(WATER_LEVEL_MIN, min(WATER_LEVEL_MAX, int(level)))
++    return WATER_LEVEL_BASE + level
++
++
++def water_code_to_level(code: int) -> int | None:
++    """water_box_mode code -> slider level, or None if it is not a slider code."""
++    level = int(code) - WATER_LEVEL_BASE
++    return level if WATER_LEVEL_MIN <= level <= WATER_LEVEL_MAX else None
++
++
++def water_level_band(level: int) -> str:
++    """The name of the band a slider level falls in ("gentle", "medium", ...)."""
++    for lo, hi, name in WATER_LEVEL_BANDS:
++        if lo <= level <= hi:
++            return name
++    return "off"
++
+ ModeEnumT = TypeVar("ModeEnumT", bound=RoborockModeEnum)
+ 
+ 
+diff --git a/roborock/data/v1/v1_code_mappings.py b/roborock/data/v1/v1_code_mappings.py
+index a346a80..001120e 100644
+--- a/roborock/data/v1/v1_code_mappings.py
++++ b/roborock/data/v1/v1_code_mappings.py
+@@ -146,6 +146,28 @@ class RoborockStartType(RoborockEnum):
+     smart_watch = 821
+ 
+ 
++class DustBinStatus(RoborockEnum):
++    """Whether the robot's own dust bin is fitted, from Status.rss.
++
++    `rss` is declared in the status container and decoded nowhere: no enum, no
++    property, no reference. It was traced by watching every status field across a
++    removal and a reinstall on a Saros 10R (2026-08-23) -- exactly one field moved,
++    in both directions: 2 -> 1 when the bin came out, 1 -> 2 when it went back.
++
++    The dock's own `dss` bitfield does NOT carry this: it read identically (2216,
++    dust-bag field 2) with the bin in and out. Note also that DustBagStatus below is
++    about the DOCK's bag, not this.
++
++    Deliberately not a RoborockDssCodes: that base maps any unrecognised value to
++    `okay`, which is how a removed bin went unnoticed. `unknown` first, so
++    RoborockEnum._missing_ lands there rather than on a member that means something.
++    """
++
++    unknown = 0
++    not_installed = 1
++    installed = 2
++
++
+ class RoborockDssCodes(RoborockEnum):
+     @classmethod
+     def _missing_(cls: type[Self], key) -> Self:
+diff --git a/roborock/data/v1/v1_containers.py b/roborock/data/v1/v1_containers.py
+index 5efc379..17e4bae 100644
+--- a/roborock/data/v1/v1_containers.py
++++ b/roborock/data/v1/v1_containers.py
+@@ -24,6 +24,7 @@ from .v1_code_mappings import (
+     ClearWaterBoxStatus,
+     DirtyWaterBoxStatus,
+     DustBagStatus,
++    DustBinStatus,
+     RoborockChargeStatus,
+     RoborockCleanType,
+     RoborockDockDustCollectionModeCode,
+@@ -129,6 +130,8 @@ class StatusV2(RoborockBase):
+     rdt: int | None = field(default=None, metadata={"feature": "is_supported_drying"})
+     clean_percent: int | None = field(default=None, metadata={"feature": "is_support_clean_estimate"})
+     rss: int | None = None
++    """Undocumented. Carries the robot's dust-bin state on at least the Saros 10R:
++    see the dust_bin_status property and DustBinStatus."""
+     dss: int | None = None
+     common_status: int | None = None
+     corner_clean_mode: int | None = None
+@@ -179,6 +182,17 @@ class StatusV2(RoborockBase):
+             return DirtyWaterBoxStatus((self.dss >> 4) & 3)
+         return None
+ 
++    @property
++    def dust_bin_status(self) -> DustBinStatus | None:
++        """The ROBOT's own dust bin -- see DustBinStatus for how this was traced.
++
++        Distinct from dust_bag_status below, which is the DOCK's bag and comes from
++        the `dss` bitfield. `dss` does not move when the robot's bin is removed.
++        """
++        if self.rss is None:
++            return None
++        return DustBinStatus(self.rss)
++
+     @property
+     def dust_bag_status(self) -> DustBagStatus | None:
+         if self.dss:
+diff --git a/roborock/devices/rpc/v1_channel.py b/roborock/devices/rpc/v1_channel.py
+index 8259994..8511564 100644
+--- a/roborock/devices/rpc/v1_channel.py
++++ b/roborock/devices/rpc/v1_channel.py
+@@ -7,6 +7,7 @@ handling both MQTT and local connections with automatic fallback.
+ import asyncio
+ import datetime
+ import logging
++import os
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import Any, TypeVar
+@@ -50,6 +51,22 @@ _TIMEOUT = 10.0
+ 
+ 
+ # Exponential backoff parameters for reconnecting to local
++# LOCAL MODIFICATION (not upstream).
++#
++# Direct local control needs a route to the vacuum's own IP on port 58867. When
++# there is none -- the vacuum on a WiFi this host cannot reach, say -- the
++# connect() below does not fail, it hangs: the SYNs are dropped rather than
++# refused, and the kernel works through tcp_syn_retries (~127s by default)
++# before giving up. That is paid once at startup, where it blows straight
++# through device.START_ATTEMPT_TIMEOUT and delays the whole application by 15s,
++# and then again on every background retry for the life of the process.
++#
++# Set RR_NO_LOCAL=1 to skip local transport entirely and use MQTT only. This is
++# deliberately not a shorter timeout: on a network where local can never work,
++# a timeout is still a wait, still repeated every retry, and still something to
++# tune. Nothing else changes -- MQTT is already the fallback for every RPC.
++NO_LOCAL = os.environ.get("RR_NO_LOCAL", "").strip().lower() in ("1", "true", "yes")
++
+ MIN_RECONNECT_INTERVAL = datetime.timedelta(minutes=1)
+ MAX_RECONNECT_INTERVAL = datetime.timedelta(minutes=10)
+ RECONNECT_MULTIPLIER = 1.5
+@@ -84,6 +101,7 @@ class RpcChannel(V1RpcChannel):
+         *,
+         response_type: type[_T] | None = None,
+         params: ParamsType = None,
++        timeout: float | None = None,
+     ) -> _T | Any:
+         """Send a command and return either a decoded or parsed response."""
+         request = RequestMessage(method, params=params)
+@@ -92,7 +110,7 @@ class RpcChannel(V1RpcChannel):
+         last_exception = None
+         for strategy in self._rpc_strategies_cb():
+             try:
+-                decoded_response = await self._send_rpc(strategy, request, self._logger)
++                decoded_response = await self._send_rpc(strategy, request, self._logger, timeout)
+             except RoborockException as e:
+                 self._logger.debug("Command %s failed on %s channel: %s", method, strategy.name, e)
+                 last_exception = e
+@@ -112,7 +130,10 @@ class RpcChannel(V1RpcChannel):
+ 
+     @staticmethod
+     async def _send_rpc(
+-        strategy: RpcStrategy, request: RequestMessage, logger: RoborockLoggerAdapter
++        strategy: RpcStrategy,
++        request: RequestMessage,
++        logger: RoborockLoggerAdapter,
++        timeout: float | None = None,
+     ) -> ResponseData | bytes:
+         """Send a command and return a decoded response type.
+ 
+@@ -149,12 +170,13 @@ class RpcChannel(V1RpcChannel):
+         unsub = await strategy.channel.subscribe(find_response)
+         try:
+             await strategy.channel.publish(message)
+-            result = await asyncio.wait_for(future, timeout=_TIMEOUT)
++            wait = _TIMEOUT if timeout is None else timeout
++            result = await asyncio.wait_for(future, timeout=wait)
+         except TimeoutError as ex:
+             if strategy.health_manager:
+                 await strategy.health_manager.on_timeout()
+             future.cancel()
+-            raise RoborockException(f"Command timed out after {_TIMEOUT}s") from ex
++            raise RoborockException(f"Command timed out after {wait}s") from ex
+         finally:
+             unsub()
+         if strategy.health_manager:
+@@ -182,6 +204,7 @@ class BlobRpcChannel(V1RpcChannel):
+         *,
+         response_type: type[_T] | None = None,
+         params: ParamsType = None,
++        timeout: float | None = None,
+     ) -> _T | Any:
+         """Send a blob command after adding the device security parameters."""
+         public_key = await self._rpc_channel.send_command(RoborockCommand.GET_RANDOM_PKEY)
+@@ -202,8 +225,9 @@ class BlobRpcChannel(V1RpcChannel):
+                 method,
+                 response_type=response_type,
+                 params=blob_params,
++                timeout=timeout,
+             )
+-        return await self._raw_blob_rpc_channel.send_command(method, params=blob_params)
++        return await self._raw_blob_rpc_channel.send_command(method, params=blob_params, timeout=timeout)
+ 
+ 
+ class V1Channel(Channel):
+@@ -362,16 +386,19 @@ class V1Channel(Channel):
+         try:
+             # Make an initial, optimistic attempt to connect to local with the
+             # cache. The cache information will be refreshed by the background task.
+-            try:
+-                await self._local_connect(prefer_cache=True)
+-            except RoborockException as err:
+-                self._logger.debug("First local connection attempt failed, will retry: %s", err)
++            if NO_LOCAL:
++                self._logger.info("RR_NO_LOCAL set: skipping local transport, MQTT only")
++            else:
++                try:
++                    await self._local_connect(prefer_cache=True)
++                except RoborockException as err:
++                    self._logger.debug("First local connection attempt failed, will retry: %s", err)
+ 
+-            # Start a background task to manage the local connection health. This
+-            # happens independent of whether we were able to connect locally now.
+-            if self._reconnect_task is None:
+-                loop = asyncio.get_running_loop()
+-                self._reconnect_task = loop.create_task(self._background_reconnect())
++                # Start a background task to manage the local connection health. This
++                # happens independent of whether we were able to connect locally now.
++                if self._reconnect_task is None:
++                    loop = asyncio.get_running_loop()
++                    self._reconnect_task = loop.create_task(self._background_reconnect())
+ 
+             # We maintain an active MQTT subscription even when connected locally to receive
+             # unsolicited status updates (DPS push messages) directly from the cloud.
+diff --git a/roborock/mqtt/session.py b/roborock/mqtt/session.py
+index 319615f..1cbd269 100644
+--- a/roborock/mqtt/session.py
++++ b/roborock/mqtt/session.py
+@@ -45,11 +45,11 @@ class MqttParams:
+     tls: bool
+     """Use TLS for the connection."""
+ 
+-    username: str
+-    """MQTT username to use for authentication."""
++    username: str | None
++    """MQTT username, or None to connect without authenticating."""
+ 
+-    password: str
+-    """MQTT password to use for authentication."""
++    password: str | None
++    """MQTT password, or None to connect without authenticating."""
+ 
+     verify_tls: bool = True
+     """Verify the TLS certificate."""
+diff --git a/roborock/protocol.py b/roborock/protocol.py
+index fc3af84..9732954 100644
+--- a/roborock/protocol.py
++++ b/roborock/protocol.py
+@@ -2,8 +2,9 @@ import binascii
+ import gzip
+ import hashlib
+ import logging
++import os
+ from collections.abc import Callable
+-from urllib.parse import urlparse
++from urllib.parse import parse_qs, unquote, urlparse
+ 
+ from construct import (  # type: ignore
+     Bytes,
+@@ -481,21 +482,104 @@ class _Parser:
+ MessageParser: _Parser = _Parser(_Messages, True)
+ 
+ 
++# LOCAL MODIFICATION: point the client at a different broker.
++#
++# The cloud hands out one MQTT endpoint (`rriot.r.m`, an `ssl://host:8883` URL)
++# and the client has no say in it. On a self-hosted stack that is the wrong
++# address: the TLS front door is for devices coming in over the internet, while a
++# panel running next to the broker should talk to it directly -- no TLS hop, no
++# round trip through the external interface, and usually no authentication
++# either, because that socket is not exposed.
++#
++# RR_MQTT_URL replaces it. Everything is expressed in the one URL:
++#
++#   mqtt://mosquitto:1883           plain TCP, keep the credentials derived below
++#   mqtt://@mosquitto:1883          plain TCP, connect anonymously (empty userinfo)
++#   mqtt://user:pass@host:1883      plain TCP, these credentials
++#   mqtts://host:8883               TLS (as the cloud URL's `ssl://` scheme means)
++#   mqtts://host:8883?verify=0      TLS without certificate verification
++#
++# The port may be left off (1883 plain, 8883 TLS). Unset the variable and nothing
++# changes: the cloud's own URL is used exactly as before.
++_MQTT_URL_ENV = "RR_MQTT_URL"
++_MQTT_TLS_SCHEMES = frozenset({"ssl", "mqtts", "mqtt+ssl", "tls", "tcps"})
++_MQTT_PLAIN_SCHEMES = frozenset({"mqtt", "tcp"})
++_MQTT_DEFAULT_PORT = 1883
++_MQTT_DEFAULT_TLS_PORT = 8883
++_FALSEY = frozenset({"0", "false", "no", "off"})
++
++
+ def create_mqtt_params(rriot: RRiot) -> MqttParams:
+-    """Return the MQTT parameters for this user."""
+-    url = urlparse(rriot.r.m)
+-    if not isinstance(url.hostname, str):
+-        raise RoborockException(f"Url parsing '{rriot.r.m}' returned an invalid hostname")
+-    if not url.port:
+-        raise RoborockException(f"Url parsing '{rriot.r.m}' returned an invalid port")
++    """Return the MQTT parameters for this user.
++
++    The broker comes from the cloud unless RR_MQTT_URL overrides it -- see the
++    note above for the forms that variable takes.
++    """
+     hashed_user = md5hex(rriot.u + ":" + rriot.k)[2:10]
+     hashed_password = md5hex(rriot.s + ":" + rriot.k)[16:]
++
++    override = os.environ.get(_MQTT_URL_ENV, "").strip()
++    if not override:
++        url = urlparse(rriot.r.m)
++        if not isinstance(url.hostname, str):
++            raise RoborockException(f"Url parsing '{rriot.r.m}' returned an invalid hostname")
++        if not url.port:
++            raise RoborockException(f"Url parsing '{rriot.r.m}' returned an invalid port")
++        return MqttParams(
++            host=str(url.hostname),
++            port=url.port,
++            tls=(url.scheme == "ssl"),
++            username=hashed_user,
++            password=hashed_password,
++        )
++
++    url = urlparse(override)
++    if url.scheme in _MQTT_TLS_SCHEMES:
++        tls = True
++    elif url.scheme in _MQTT_PLAIN_SCHEMES:
++        tls = False
++    else:
++        raise RoborockException(
++            f"{_MQTT_URL_ENV} '{override}': scheme must be one of "
++            f"{', '.join(sorted(_MQTT_TLS_SCHEMES | _MQTT_PLAIN_SCHEMES))}"
++        )
++    if not isinstance(url.hostname, str) or not url.hostname:
++        raise RoborockException(f"{_MQTT_URL_ENV} '{override}' has no hostname")
++
++    # `mqtt://host` keeps the credentials the cloud implies; `mqtt://@host` is an
++    # explicit "send none", which is what an unauthenticated internal broker wants;
++    # anything in between is used as given.
++    if url.username is None:
++        username: str | None = hashed_user
++        password: str | None = hashed_password
++    elif url.username == "" and not url.password:
++        username = password = None
++    else:
++        username = unquote(url.username)
++        password = unquote(url.password) if url.password else None
++
++    verify = True
++    for key, values in parse_qs(url.query).items():
++        if key.lower() in ("verify", "verify_tls", "tls_verify"):
++            verify = values[-1].strip().lower() not in _FALSEY
++        else:
++            raise RoborockException(f"{_MQTT_URL_ENV} '{override}': unknown option '{key}'")
++
++    _LOGGER.info(
++        "Using %s from the environment: %s:%s tls=%s auth=%s",
++        _MQTT_URL_ENV,
++        url.hostname,
++        url.port or (_MQTT_DEFAULT_TLS_PORT if tls else _MQTT_DEFAULT_PORT),
++        tls,
++        "anonymous" if username is None else username,
++    )
+     return MqttParams(
+         host=str(url.hostname),
+-        port=url.port,
+-        tls=(url.scheme == "ssl"),
+-        username=hashed_user,
+-        password=hashed_password,
++        port=url.port or (_MQTT_DEFAULT_TLS_PORT if tls else _MQTT_DEFAULT_PORT),
++        tls=tls,
++        username=username,
++        password=password,
++        verify_tls=verify,
+     )
+ 
+ 
+diff --git a/roborock/protocols/v1_protocol.py b/roborock/protocols/v1_protocol.py
+index 733f48a..6d45ca1 100644
+--- a/roborock/protocols/v1_protocol.py
++++ b/roborock/protocols/v1_protocol.py
+@@ -8,6 +8,7 @@ import json
+ import logging
+ import secrets
+ import struct
++import time
+ import zlib
+ from collections.abc import Callable
+ from dataclasses import dataclass, field
+@@ -275,33 +276,112 @@ class BlobResponse:
+     """The blob data, decompressed."""
+ 
+ 
++# LOCAL MODIFICATION: fragmented blobs.
++#
++# A blob that does not fit in one MQTT message is split, and the pieces are only
++# recognisable together. Observed on a Saros 10R fetching two obstacle photos
++# (`get_photo`, type 0, the whole camera frame):
++#
++#   64 KB frame  proto=301 seq=? rnd=?      ROBOROCK... payload_size=64413  -> complete
++#   88 KB frame  proto=300 seq=1 rnd=62633  ROBOROCK... payload_size=88001  -> 65232 bytes
++#                proto=301 seq=2 rnd=62633  <no header>                        22817 bytes
++#
++# So: protocol 300 marks the FIRST fragment of a fragmented blob, 301 is a
++# single-frame blob or a continuation, `random` is shared by the fragments of one
++# blob and `seq` numbers them from 1. Upstream only accepted 301 and required the
++# declared payload to fit inside that one message, so the 88 KB photo was dropped
++# on the floor and its caller timed out -- which read as "the vacuum no longer has
++# this photo" when the vacuum was in fact sending it.
++#
++# The declared payload_size runs 8 bytes past what actually arrives, exactly the
++# length of a gzip trailer (CRC32 + ISIZE), so the reassembled stream is
++# decompressed with zlib rather than gzip.decompress: same bytes out, but it does
++# not insist on a trailer it is never sent.
++_BLOB_FRAGMENT_FIRST = 300
++_BLOB_HEADER_MAGIC = b"ROBOROCK"
++_BLOB_MIN_HEADER = 24
++# A fragmented blob's pieces arrive back to back (30 ms apart when measured); this
++# is only a guard against a lost tail wedging the buffer forever.
++_BLOB_FRAGMENT_TTL = 30.0
++
++
++def _gunzip(data: bytes) -> bytes:
++    """gzip-decompress, tolerating the missing 8-byte trailer (see above)."""
++    try:
++        return Utils.decompress(data)
++    except (gzip.BadGzipFile, EOFError, zlib.error):
++        pass
++    obj = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
++    out = obj.decompress(data) + obj.flush()
++    if not out:
++        raise RoborockException("Failed to decode blob message payload")
++    return out
++
++
+ def create_blob_response_decoder() -> Callable[[RoborockMessage], BlobResponse | None]:
+     """Create a decoder for V1 blob response messages.
+ 
+     Obstacle photos are acknowledged through the normal RPC response with
+-    ``["ok"]`` and delivered later as a protocol-301 blob frame. The frame starts
+-    with ``ROBOROCK``, stores the RPC request id at bytes 8-11, the header size
+-    at bytes 16-17, and the gzip payload length at bytes 20-23.
++    ``["ok"]`` and delivered later as a blob frame. The frame starts with
++    ``ROBOROCK``, stores the RPC request id at bytes 8-11, the header size at
++    bytes 16-17, and the gzip payload length at bytes 20-23. A frame too big for
++    one message continues in further messages that carry no header -- see the note
++    above for how they are tied together.
+     """
+ 
++    # blob id (message.random) -> partial blob
++    pending: dict[int, dict[str, Any]] = {}
++
++    def _expire(now: float) -> None:
++        for blob_id in [k for k, v in pending.items() if now - v["at"] > _BLOB_FRAGMENT_TTL]:
++            _LOGGER.debug("Dropping incomplete blob fragment %s", blob_id)
++            del pending[blob_id]
++
+     def _decode_blob_response(message: RoborockMessage) -> BlobResponse | None:
+-        """Decode a V1 blob response message."""
+-        if message.protocol != RoborockMessageProtocol.MAP_RESPONSE:
++        """Decode a V1 blob response message, reassembling fragments."""
++        if message.protocol not in (RoborockMessageProtocol.MAP_RESPONSE, _BLOB_FRAGMENT_FIRST):
+             return None
+         payload = message.payload
+-        if not payload or not payload.startswith(b"ROBOROCK") or len(payload) < 24:
++        if not payload:
+             return None
+-        request_id = int.from_bytes(payload[8:12], "little")
+-        header_size = int.from_bytes(payload[16:18], "little")
+-        payload_size = int.from_bytes(payload[20:24], "little")
+-        end_offset = header_size + payload_size
+-        if header_size < 24 or end_offset > len(payload):
+-            raise RoborockException("Invalid V1 blob response format")
+-        try:
+-            data = Utils.decompress(payload[header_size:end_offset])
+-        except (gzip.BadGzipFile, EOFError, zlib.error) as err:
+-            raise RoborockException("Failed to decode blob message payload") from err
+-        return BlobResponse(request_id=request_id, data=data)
++        _expire(time.time())
++
++        if payload.startswith(_BLOB_HEADER_MAGIC):
++            if len(payload) < _BLOB_MIN_HEADER:
++                return None
++            request_id = int.from_bytes(payload[8:12], "little")
++            header_size = int.from_bytes(payload[16:18], "little")
++            payload_size = int.from_bytes(payload[20:24], "little")
++            if header_size < _BLOB_MIN_HEADER:
++                raise RoborockException("Invalid V1 blob response format")
++            body = payload[header_size:]
++            if len(body) >= payload_size:
++                return BlobResponse(request_id=request_id, data=_gunzip(body[:payload_size]))
++            # Fragmented: keep the head and wait for the rest.
++            pending[message.random] = {
++                "request_id": request_id,
++                "need": payload_size,
++                "chunks": [body],
++                "have": len(body),
++                "at": time.time(),
++            }
++            return None
++
++        # No header: a continuation of the blob with the same `random`. Anything
++        # else on this protocol (a map push, say) has no pending blob to join and
++        # is left to the decoder that does own it.
++        state = pending.get(message.random)
++        if state is None:
++            return None
++        state["chunks"].append(payload)
++        state["have"] += len(payload)
++        # The last fragment is short by the gzip trailer, so "complete" cannot be
++        # an equality test.
++        if state["have"] + 8 < state["need"]:
++            return None
++        del pending[message.random]
++        data = b"".join(state["chunks"])[: state["need"]]
++        return BlobResponse(request_id=state["request_id"], data=_gunzip(data))
+ 
+     return _decode_blob_response
+ 
+@@ -338,12 +418,17 @@ class V1RpcChannel(Protocol):
+     for sending commands and receiving responses.
+     """
+ 
++    # LOCAL MODIFICATION: `timeout` overrides the channel default for one call.
++    # Needed for the big blob commands -- the full-frame obstacle photo does not
++    # always come back inside the default 10s, and a retry cannot help because the
++    # late reply carries the abandoned request's id.
+     @overload
+     async def send_command(
+         self,
+         method: CommandType,
+         *,
+         params: ParamsType = None,
++        timeout: float | None = None,
+     ) -> Any:
+         """Send a command and return a decoded response."""
+         ...
+@@ -355,6 +440,7 @@ class V1RpcChannel(Protocol):
+         *,
+         response_type: type[_T],
+         params: ParamsType = None,
++        timeout: float | None = None,
+     ) -> _T:
+         """Send a command and return a parsed response RoborockBase type."""
+         ...
+diff --git a/roborock/roborock_typing.py b/roborock/roborock_typing.py
+index 37cdf4d..f560a93 100644
+--- a/roborock/roborock_typing.py
++++ b/roborock/roborock_typing.py
+@@ -78,6 +78,15 @@ class RoborockCommand(str, Enum):
+     GET_CLEAN_FOLLOW_GROUND_MATERIAL_STATUS = "get_clean_follow_ground_material_status"
+     GET_CLEAN_MOTOR_MODE = "get_clean_motor_mode"
+     GET_CLEAN_RECORD = "get_clean_record"
++    # Per-run event timeline for a FINISHED clean, as the phone app fetches it
++    # when a history entry is opened. Captured off the wire from the Roborock
++    # app against a Saros 10R:
++    #   get_clean_detail {"begin": <record begin>, "from": 0, "id": 0, "type": 0}
++    #   -> {"begin":..., "from":..., "num": 27, "more": 0,
++    #       "events": [{"t": <epoch>, "i": <event kind>, "e": "<json string>"}]}
++    # Distinct from get_rt_clean_detail, which only covers the run in progress
++    # and returns {} once it has finished.
++    GET_CLEAN_DETAIL = "get_clean_detail"
+     GET_CLEAN_RECORD_MAP = "get_clean_record_map"
+     GET_CLEAN_SEQUENCE = "get_clean_sequence"
+     GET_CLEAN_SUMMARY = "get_clean_summary"

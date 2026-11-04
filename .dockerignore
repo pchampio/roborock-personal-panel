@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+.deps
+.venv
+node_modules
+__pycache__
+**/__pycache__
+data
+docs
+app/*.json
+app/*.jsonl*
+app/sounds
+app/*_photos
