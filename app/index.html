@@ -5819,13 +5819,9 @@ async function openDockSheet(){
   try{ careData=await api("/api/mop_care"); }catch(e){ careData=null; }
   renderDockRows();
 }
-// The dock does not reliably wash and then dry after a mopping run, so the server
-// watches for it: once the robot has been parked long enough to be sure it is
-// finished, it checks whether each of the two happened and asks for whichever did
-// not -- wash first, then dry. It retries every half minute, which is exactly why
-// this row exists: stopping the cycle by hand would otherwise have it started
-// again a moment later, so Arrêter stops it AND takes the run off the list.
-const CARE_PHASE={idle:"en veille", wash:"lavage lancé", dry:"séchage lancé",
+// After an interrupted clean, the server fills in missing dock care:
+// empty outside DND hours, then wash and dry used pads. The switch cancels it.
+const CARE_PHASE={idle:"en veille", dust:"vidage lancé", wash:"lavage lancé", dry:"séchage lancé",
                   done:"terminé"};
 function careRow(){
   const c=careData||{};
@@ -5835,11 +5831,12 @@ function careRow(){
   else if(!c.enabled) bits.push("désactivé");
   else{
     bits.push(CARE_PHASE[c.phase]||c.phase||"—");
+    bits.push(c.dust_skipped?"vidage suspendu (ne pas déranger)":"vidage "+(c.emptied?"fait":c.dust_attempted?"à vérifier":"attendu"));
     bits.push("lavage "+(c.washed?"vu":"attendu"));
     bits.push("séchage "+(c.dried?"vu":"attendu"));
   }
   if(c.note && c.note!=="désactivé") bits.push(c.note);
-  row.innerHTML='<div class="dtxt"><div class="dname">Après un lavage, automatiquement</div>'+
+  row.innerHTML='<div class="dtxt"><div class="dname">Après un nettoyage interrompu</div>'+
                 '<div class="dmode">'+bits.filter(Boolean).join(" | ")+'</div></div>';
   // A switch rather than a stop button: the server keeps the preference, so it
   // holds across a restart and reads the same on every device. Switching it off
@@ -5848,7 +5845,7 @@ function careRow(){
   const sw=document.createElement("input");
   sw.type="checkbox"; sw.className="sw"; sw.checked=!!c.enabled;
   sw.disabled=!c.available;
-  sw.title="Laver puis sécher la serpillière quand un nettoyage l'a utilisée";
+  sw.title="Vider le bac hors des heures calmes, laver puis sécher les serpillières utilisées";
   sw.onchange=async()=>{
     sw.disabled=true;
     try{ careData=await post("/api/mop_care",{enable:sw.checked});
@@ -8959,7 +8956,7 @@ const ICON_PAUSE='<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5"
 const ICON_PLAY='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.2v13.6a1 1 0 0 0 1.53.85l10.2-6.8a1 1 0 0 0 0-1.7L9.53 4.35A1 1 0 0 0 8 5.2z"/></svg>';
 /* Stopped by a fault with the job still owed (in_cleaning says which kind is
    outstanding) is the same question as paused: the robot is waiting for you, and
-   play is the answer once the brush is cleared. The server's resume ladder picks
+   play is the answer once the brush is cleared. The server picks
    the right command; a fault that is still there comes back as its refusal. */
 function syncPauseButton(st){
   const b=$("cmd_pause"); if(!b || !st) return;

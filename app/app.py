@@ -37,7 +37,9 @@ import unicodedata
 import sys
 import time
 import typing
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiohttp import WSMsgType, web
 
@@ -1807,7 +1809,7 @@ def _resume_plan(duid: str, st: typing.Any, props: typing.Any = None, status_cls
 
     Two different things wear that name:
       * vacuum resume -- the robot is merely paused and its own firmware still
-        holds the job. app_start picks up exactly where it left off.
+        holds the job. Its matching resume command continues that job.
       * program resume -- the run was aborted (error, stop, dock) and the robot
         has forgotten it. We re-issue a segment clean for only the rooms our
         job record says never got cleaned. That is a true resume of the
@@ -1837,8 +1839,8 @@ def _resume_plan(duid: str, st: typing.Any, props: typing.Any = None, status_cls
             "errors": logged.get("errors") or [],
         }
 
-    if state == RoborockStateCode.paused.value:
-        plan.update(available=True, kind="vacuum", reason="Robot is paused; its own job is still loaded.")
+    if state in (RoborockStateCode.paused.value, RoborockStateCode.error.value) and in_cleaning in (1, 2, 3, 4):
+        plan.update(available=True, kind="vacuum", reason="The firmware still holds the interrupted job.")
 
     # No usable job record -- reconstruct from the map's own path trace.
     #
@@ -1870,7 +1872,7 @@ def _resume_plan(duid: str, st: typing.Any, props: typing.Any = None, status_cls
     if last is not None and duid and RUNS.resume_dismissed(
             duid, float(_int_or_none(last.get("begin")) or 0)):
         plan["dismissed"] = True
-    if last is not None:
+    if last is not None and plan["kind"] != "vacuum":
         if last.get("complete") and not last.get("error"):
             plan["not_resumable"] = "completed"
         elif last.get("clean_type") == 2:
@@ -2000,6 +2002,7 @@ _MOP_PARTS = {"mop", "water_box"}
 _DOCK_BUSY_FR = {
     "drying": "séchage de la serpillière",
     "washing": "lavage de la serpillière",
+    "emptying": "vidage du bac",
 }
 # The state codes that ARE the robot washing, from the library's own enum. Included
 # because a wash can also be reported this way, and then the headline already says
@@ -2073,6 +2076,8 @@ def _dock_activity(st: typing.Any) -> list[str]:
     reports `charging` throughout) and washing-as-a-state does not.
     """
     out: list[str] = []
+    if _int_or_none(getattr(st, "state", None)) == RoborockStateCode.emptying_the_bin.value:
+        out.append("emptying")
     if _int_or_none(getattr(st, "dry_status", None)):
         out.append("drying")
     if _int_or_none(getattr(st, "wash_phase", None)):
@@ -4627,6 +4632,34 @@ def _current_modes(st: typing.Any) -> dict:
             "mop": _int_or_none(st.mop_mode), "repeat": _int_or_none(st.repeat) or 1}
 
 
+async def _resume_loaded_job(props: typing.Any) -> typing.Any:
+    """Resume only the job the firmware still holds; never fall back to a new clean."""
+    await props.status.refresh()
+    st = props.status
+    kind = _int_or_none(getattr(st, "in_cleaning", None))
+    state = _int_or_none(getattr(st, "state", None))
+    if state in CLEANING_STATES:
+        raise web.HTTPConflict(reason="Le robot nettoie déjà.")
+    # Firmware job types: 1 = whole house, 2 = zones, 3 = rooms, 4 = mapping.
+    # APP_START on a held room/zone job starts a NEW whole-house clean.
+    command = {
+        1: RoborockCommand.APP_START,
+        2: RoborockCommand.RESUME_ZONED_CLEAN,
+        3: RoborockCommand.RESUME_SEGMENT_CLEAN,
+        4: RoborockCommand.APP_RESUME_BUILD_MAP,
+    }.get(kind)
+    if _int_or_none(getattr(st, "in_returning", None)) == 1:
+        command = RoborockCommand.APP_CHARGE
+    if command is None:
+        raise web.HTTPConflict(reason="Aucun nettoyage en pause à reprendre.")
+    try:
+        result = await props.command.send(command)
+    except Exception as exc:
+        raise web.HTTPBadGateway(reason="Reprise refusée par le robot.") from exc
+    _LOGGER.info("resume via %s (in_cleaning=%s)", command, kind)
+    return result
+
+
 async def handle_command(request: web.Request) -> web.Response:
     body = await request.json()
     action = str(body.get("action", "")).strip()
@@ -4636,34 +4669,12 @@ async def handle_command(request: web.Request) -> web.Response:
             await PATROL.stop()
         else:
             _patrol_available()
-    # `resume` is not one command: which one depends on what was paused, and only
-    # the robot knows that. in_cleaning says WHICH kind of job is outstanding (2 for
-    # a zone run, 1 for rooms), so the pairing comes from the device rather than from
-    # whatever the browser last saw -- which is what makes a resume from a second
-    # phone work as well as from the one that pressed pause.
     if action != "resume" and command is None:
         raise web.HTTPBadRequest(reason=f"unknown action {action!r}")
     async with STATE._lock:
         props = await STATE.props()
         if action == "resume":
-            kind = _int_or_none(getattr(props.status, "in_cleaning", None)) or 0
-            ladder = ([RoborockCommand.RESUME_ZONED_CLEAN] if kind == 2
-                      else [RoborockCommand.RESUME_SEGMENT_CLEAN] if kind == 1
-                      else [])
-            # APP_START last: it resumes a paused job on this firmware and is the
-            # only thing left for a paused run that reports no kind at all.
-            ladder.append(RoborockCommand.APP_START)
-            result, err = None, None
-            for cmd in ladder:
-                try:
-                    result = await props.command.send(cmd)
-                    _LOGGER.info("resume via %s", cmd)
-                    break
-                except Exception as exc:  # noqa: BLE001 -- try the next rung
-                    _LOGGER.info("resume: %s refused (%s)", cmd, exc)
-                    err = exc
-            else:
-                raise web.HTTPBadGateway(reason=f"resume refused: {err}")
+            result = await _resume_loaded_job(props)
         else:
             result = await props.command.send(command)
         duid = STATE.selected_duid or ""
@@ -4937,17 +4948,11 @@ async def _wash_then_resume(duid: str, rooms: list[int], repeat: int, modes: dic
 
 # --- looking after the mop once the run is over ---------------------------
 #
-# The dock does not always wash and dry after a mopping job. Whether it decides to
-# is not something this panel can read -- the wash and the dry both happen after
-# job_end, outside the run's own event log, and `dry_status` only says whether one
-# is happening NOW. So instead of predicting it, this watches: once the robot has
-# been parked long enough to be sure it is finished, it looks at whether a wash and
-# then a dry actually happened since the run ended, and asks for whichever is
-# missing. Wash first, then dry, because drying a dirty pad is pointless.
-#
-# Deliberately conservative. It acts once per run and never while anything is
-# moving, and one press of Arrêter in the Entretien sheet stops the current cycle
-# and takes that run off the list for good.
+# After an interrupted clean, let the dock settle before filling in missing care.
+# Only actual docked states qualify. Use the robot's record to identify the run,
+# and journal evidence to distinguish a final wash from a mid-job wash. Emptying
+# is attempted once, outside the device's DND schedule; then wash/dry if needed.
+# The existing care switch disables the whole automatic sequence.
 MOP_CARE = os.environ.get("RR_MOP_CARE", "1").strip().lower() in ("1", "true", "yes")
 MOP_CARE_PATH = os.environ.get("RR_MOP_CARE_DB", str(HERE / "mop_care.json"))
 MOP_CARE_SETTLE = float(os.environ.get("RR_MOP_CARE_SETTLE", "240"))
@@ -4962,14 +4967,16 @@ MOP_CARE_TRIES = 2
 _PARKED_STATES = {
     RoborockStateCode.charging.value,
     RoborockStateCode.charging_complete.value,
-    RoborockStateCode.idle.value,
 }
 
 _mop_care: dict = {
     "run": None,        # the run key we are looking after
-    "phase": "idle",    # idle | wash | dry | done | off
+    "phase": "idle",    # idle | dust | wash | dry | done | off
     "washed": False,
     "dried": False,
+    "emptied": False,
+    "dust_skipped": False,
+    "dust_attempted": False,
     "since": 0.0,       # when the robot became parked
     "tries": {},        # cycle -> how many times we have asked for it
     "note": "",
@@ -5015,6 +5022,9 @@ def _mop_care_state() -> dict:
         "run": _mop_care["run"],
         "washed": _mop_care["washed"],
         "dried": _mop_care["dried"],
+        "emptied": _mop_care["emptied"],
+        "dust_skipped": _mop_care["dust_skipped"],
+        "dust_attempted": _mop_care["dust_attempted"],
         "note": _mop_care["note"],
         "settle": MOP_CARE_SETTLE,
     }
@@ -5044,48 +5054,177 @@ def _run_used_mop(run: dict | None) -> bool:
     return False
 
 
-def _care_evidence(since: float) -> tuple[bool, bool]:
-    """Has the pad been washed, and dried since that wash, in this run's window?
+def _care_evidence(begin: float, ended: float, duration: int) -> tuple[bool, bool, bool, bool, bool]:
+    """Final care only: a mid-job wash is invalidated by further cleaning.
 
-    Read out of the journal rather than kept in memory, because the panel gets
-    restarted and the dock's own cycle can easily fall in the gap -- and a watcher
-    that forgets an already-done wash re-runs it. `dock_busy` rows are written on
-    every transition, which is exactly the trail needed.
-
-    `since` is the run's START, not its end, and the test is "was there a dry after
-    the LAST wash". Both details are the fix for a redundant wash the watcher asked
-    for on 2026-09-09: the dock washed the pads at 17:28 while the robot was still
-    docked mid-run and dried them at 17:33 as the run closed, so a window that
-    began at the run's end saw a dry with no wash before it, decided the pad had
-    never been washed, and started a second wash three seconds after the user had
-    stopped the first one. Whether the dock's wash falls just inside or just
-    outside the end of the run is not a distinction worth acting on.
-
-    The one case this reads generously: a dock that washes on the way OUT and never
-    again is taken as having washed. Better than washing a clean pad twice.
+    A wash can precede the record's end. Its clean_time must then already equal
+    the final duration. This preserves a genuine final wash across restarts.
     """
-    last_wash = 0.0
-    dried_at = 0.0
+    last_wash = dried_at = 0.0
+    emptied = skipped = attempted = False
+    for path in (Path(LAUNCH_JOURNAL + ".1"), Path(LAUNCH_JOURNAL)):
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                        when = float(row.get("t") or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    if when < begin:
+                        continue
+                    payload = row.get("payload") or {}
+                    if row.get("kind") == "dock_busy":
+                        final = when >= ended or (duration > 0 and
+                            (_int_or_none(payload.get("clean_time")) or 0) >= duration)
+                        if not final:
+                            continue
+                        to = payload.get("to") or []
+                        if "washing" in to and "washing" not in (payload.get("from") or []):
+                            last_wash = when
+                        if "drying" in to:
+                            dried_at = when
+                        if "emptying" in to:
+                            emptied = True
+                    # Do not repeat an accepted manual or automatic empty command,
+                    # including if a short cycle happened between status polls.
+                    elif (row.get("kind") == "command" and when >= ended
+                          and payload.get("method") == "app_start_collect_dust"
+                          and payload.get("result") in (["ok"], "ok")):
+                        emptied = True
+                    elif (row.get("kind") == "mop_care" and when >= ended
+                          and payload.get("action") in ("dust", "dust_skipped_dnd")
+                          and payload.get("run") == int(begin)):
+                        if payload["action"] == "dust":
+                            attempted = True  # one attempt, even after a timeout/restart
+                        else:
+                            skipped = True
+        except OSError:
+            continue
+    return bool(last_wash), bool(last_wash and dried_at >= last_wash), emptied, skipped, attempted
+
+
+async def _care_dnd(props: typing.Any) -> bool:
+    """True also on unavailable settings: never guess when it is safe to be loud."""
     try:
-        with open(LAUNCH_JOURNAL, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if '"dock_busy"' not in line:
-                    continue
+        await props.dnd.refresh()
+        dnd = props.dnd
+        if dnd.enabled == 0:
+            return False
+        if dnd.enabled != 1:
+            return True
+        zone = _first(await props.command.send(RoborockCommand.GET_TIMEZONE))
+        local = datetime.now(ZoneInfo(zone))
+        start = int(dnd.start_hour) * 60 + int(dnd.start_minute)
+        end = int(dnd.end_hour) * 60 + int(dnd.end_minute)
+        if not (0 <= start < 1440 and 0 <= end < 1440):
+            return True
+        now = local.hour * 60 + local.minute
+        return start <= now < end if start < end else now >= start or now < end
+    except Exception:
+        _LOGGER.info("automatic dust emptying skipped: DND schedule unavailable")
+        return True
+
+
+def _run_used_vacuum(run: dict | None) -> bool:
+    settings = [(run or {}).get("requested") or {}]
+    settings += (run or {}).get("requested_per_room") or []
+    settings += (run or {}).get("requested_zones") or []
+    fans = [_int_or_none(s.get("fan")) for s in settings if s.get("fan") is not None]
+    return not fans or any(fan != 106 for fan in fans)  # 106 = suction off / mop only
+
+
+async def _mop_care_tick() -> None:
+    async with STATE._lock:
+        if not STATE.devices:
+            return
+        props = await STATE.props()
+        await props.status.refresh()
+        st = props.status
+        state = _int_or_none(getattr(st, "state", None))
+        busy = _dock_activity(st)
+        _note_dock_busy(st, busy)
+        # Idle away from the station is not docked. Never launch dock care there,
+        # during an outstanding job, a fault, a route, or another dock cycle.
+        parked = state in _PARKED_STATES and not getattr(st, "in_cleaning", None)
+        if (not parked or getattr(st, "error_code", None) or PATROL.active
+                or "washing" in busy or "emptying" in busy):
+            _mop_care["since"] = 0.0
+            return
+        now = time.time()
+        if not _mop_care["since"]:
+            _mop_care["since"] = now
+        if now - _mop_care["since"] < MOP_CARE_SETTLE:
+            return
+        rec = await _last_run(props)
+        if not rec:
+            return
+        key = _int_or_none(rec.get("begin"))
+        if key != _mop_care["run"]:
+            _mop_care.update(run=key, phase="idle", washed=False, dried=False,
+                             emptied=False, dust_skipped=False, dust_attempted=False, tries={}, asked_at=0, note="")
+        if _mop_care["phase"] == "done":
+            return
+        ended = float(rec.get("end") or 0)
+        if rec.get("complete") and not rec.get("error"):
+            _mop_care.update(phase="done", note="terminé normalement")
+            return
+        if ended and ended < _care_cfg["armed_at"]:
+            _mop_care.update(phase="done", note="hors service")
+            return
+        if not ended or now - ended > MOP_CARE_MAX_AGE:
+            _mop_care.update(phase="done", note="trop ancien")
+            return
+        duration = _int_or_none(rec.get("duration_sec")) or 0
+        if duration <= 0 or rec.get("clean_type") not in (1, 2, 3):
+            _mop_care.update(phase="done", note="aucun nettoyage")
+            return
+        run = RUNS.for_run(STATE.selected_duid or "", float(key or 0))
+        mopped = bool(rec.get("mopped") or rec.get("wash_count") or _run_used_mop(run))
+        washed, dried, emptied, skipped, attempted = _care_evidence(float(key), ended, duration)
+        _mop_care.update(washed=washed, dried=dried, emptied=emptied, dust_skipped=skipped, dust_attempted=attempted)
+
+        # Empty once after an interrupted vacuum job. During DND skip it for this
+        # return, rather than surprise everyone with a delayed empty in the morning.
+        if not emptied and not attempted and not skipped and _run_used_vacuum(run):
+            if await _care_dnd(props):
+                _mop_care["dust_skipped"] = True
+                _journal("mop_care", {"action": "dust_skipped_dnd", "run": key})
+            else:
+                _journal("mop_care", {"action": "dust", "run": key})
+                _mop_care.update(phase="dust", note="vidage demandé")
                 try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                when = float(row.get("t") or 0)
-                if when < since:
-                    continue
-                to = (row.get("payload") or {}).get("to") or []
-                if "washing" in to:
-                    last_wash = when
-                if "drying" in to:
-                    dried_at = when
-    except OSError:
-        pass
-    return bool(last_wash), bool(last_wash and dried_at >= last_wash)
+                    await props.command.send(RoborockCommand.APP_START_COLLECT_DUST)
+                except Exception as exc:
+                    _LOGGER.info("automatic dust emptying refused: %s", exc)
+                return
+        if not mopped:
+            _mop_care.update(phase="done", note="sans lavage de serpillière")
+            return
+        for cycle, seen, note in (("wash", washed, "lavage"), ("dry", dried, "séchage")):
+            if seen:
+                continue
+            tries = _mop_care["tries"]
+            # Allow time for the robot to enter the requested cycle before retrying.
+            if now - _mop_care.get("asked_at", 0) < MOP_CARE_SETTLE:
+                return
+            if tries.get(cycle, 0) >= MOP_CARE_TRIES:
+                _mop_care.update(phase="done", note=note + " sans effet")
+                _journal("mop_care", {"action": "gave_up", "cycle": cycle, "run": key})
+                return
+            tries[cycle] = tries.get(cycle, 0) + 1
+            _mop_care.update(phase=cycle, note=note + " demandé", asked_at=now)
+            try:
+                if cycle == "wash":
+                    await props.command.send(RoborockCommand.APP_START_WASH)
+                else:
+                    await _set_dryer(props.command, 1)
+            except Exception as exc:
+                _LOGGER.info("mop care: %s refused (%s)", cycle, exc)
+            _journal("mop_care", {"action": cycle, "run": key, "try": tries[cycle]})
+            return
+        _mop_care.update(phase="done", note="lavage et séchage faits")
+        _journal("mop_care", {"action": "done", "run": key})
 
 
 async def _mop_care_watch(app: web.Application) -> None:
@@ -5094,115 +5233,10 @@ async def _mop_care_watch(app: web.Application) -> None:
         if not MOP_CARE or not _care_cfg["enabled"]:
             continue
         try:
-            async with STATE._lock:
-                if not STATE.devices:
-                    continue
-                props = await STATE.props()
-                st = props.status
-                state = _int_or_none(getattr(st, "state", None))
-                busy = _dock_activity(st)
-                parked = (state in _PARKED_STATES
-                          and not _is_running(state, getattr(st, "in_cleaning", None))
-                          and not getattr(st, "in_cleaning", None))
-                if not parked:
-                    # Anything moving resets the clock: "docked for a while" has to
-                    # mean uninterrupted, or a dock excursion mid-run would count.
-                    _mop_care["since"] = 0.0
-                    if _mop_care["phase"] in ("wash", "dry"):
-                        _mop_care["note"] = "en cours"
-                    continue
-                now = time.time()
-                if not _mop_care["since"]:
-                    _mop_care["since"] = now
-                # A cycle we asked for counts as observed the moment we see it.
-                if "washing" in busy:
-                    _mop_care["washed"] = True
-                if "drying" in busy:
-                    _mop_care["dried"] = True
-                if now - _mop_care["since"] < MOP_CARE_SETTLE:
-                    continue
-
-                # The ROBOT's record of its last run, not our run log. Two wrong
-                # cycles in October came from trusting the log: on 10-12 last_run()
-                # returned a synthetic "unknown" duplicate the sampler had written a
-                # few seconds after our launch, whose device-observed modes claimed
-                # water 235 for a job sent dry; on 10-06 it returned a 10-01 run
-                # whose ended_at the sampler had kept fresh for five days, so the
-                # age guard never tripped. The clean record has neither problem:
-                # one entry per run, a real end time, and its own verdict.
-                rec = _last_run_cached()
-                if not rec:
-                    continue
-                key = _int_or_none(rec.get("begin"))
-                if key != _mop_care["run"]:
-                    _mop_care.update(run=key, phase="idle", washed=False,
-                                     dried=False, tries={}, note="")
-                if _mop_care["phase"] == "done":
-                    continue
-                # A run that went to the end is the dock's to look after. It washes
-                # and dries on its own after a completed mopping job, and stepping
-                # in there is exactly the unwanted wash-then-dry. Only a run that
-                # failed or was cut short can have missed its care.
-                if rec.get("complete") and not rec.get("error"):
-                    _mop_care.update(phase="done", note="terminé normalement")
-                    continue
-                run = RUNS.for_run(STATE.selected_duid or "", float(key or 0))
-                if not _run_used_mop(run):
-                    _mop_care.update(phase="done", note="pas de serpillière")
-                    continue
-                ended = float(rec.get("end") or 0)
-                if ended and ended < _care_cfg["armed_at"]:
-                    # It was switched off while this run was waiting to be looked
-                    # after. Switching back on is for the next one.
-                    _mop_care.update(phase="done", note="hors service")
-                    continue
-                if not ended or now - ended > MOP_CARE_MAX_AGE:
-                    # Old news. Washing a pad hours after the fact is not looking
-                    # after it, and on a fresh start the last run in the log can
-                    # be days old -- that must not fire a cycle.
-                    _mop_care.update(phase="done", note="trop ancien")
-                    continue
-                seen_wash, seen_dry = _care_evidence(float(key or ended))
-                _mop_care["washed"] = _mop_care["washed"] or seen_wash
-                _mop_care["dried"] = _mop_care["dried"] or seen_dry
-
-                tries = _mop_care["tries"]
-                for cycle, seen, phase, note in (
-                        ("wash", _mop_care["washed"], "wash", "lavage"),
-                        ("dry", _mop_care["dried"], "dry", "séchage")):
-                    if seen:
-                        continue
-                    if tries.get(cycle, 0) >= MOP_CARE_TRIES:
-                        # Asked for and never observed. Stop rather than keep at it,
-                        # and say so: something at the dock is refusing, and this
-                        # row is the only place that would ever tell you.
-                        _mop_care.update(phase="done", note=note + " sans effet")
-                        _journal("mop_care", {"action": "gave_up", "cycle": cycle,
-                                              "run": key})
-                        _LOGGER.info("mop care: %s never happened, giving up "
-                                     "(run %s)", cycle, key)
-                        break
-                    tries[cycle] = tries.get(cycle, 0) + 1
-                    _mop_care.update(phase=phase, note=note + " demandé")
-                    try:
-                        if cycle == "wash":
-                            await _raw(props.command, RoborockCommand.APP_START_WASH)
-                        else:
-                            await _set_dryer(props.command, 1)
-                    except Exception as exc:  # noqa: BLE001
-                        _LOGGER.info("mop care: %s refused (%s)", cycle, exc)
-                    _journal("mop_care", {"action": cycle, "run": key,
-                                          "try": tries[cycle]})
-                    _LOGGER.info("mop care: asked the dock to %s (run %s, try %d)",
-                                 cycle, key, tries[cycle])
-                    break
-                else:
-                    _mop_care.update(phase="done", note="lavage et séchage faits")
-                    _journal("mop_care", {"action": "done", "run": key})
-                continue
+            await _mop_care_tick()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 -- a watcher must not die
+        except Exception as exc:
             _LOGGER.debug("mop care tick failed: %s", exc)
 
 
@@ -5406,6 +5440,8 @@ async def handle_mop_care(request: web.Request) -> web.Response:
         async with STATE._lock:
             props = await STATE.props()
             busy = _dock_activity(props.status)
+            if "emptying" in busy:
+                await _raw(props.command, RoborockCommand.APP_STOP_COLLECT_DUST)
             if "washing" in busy:
                 await _raw(props.command, RoborockCommand.APP_STOP_WASH)
             if "drying" in busy:
@@ -5416,7 +5452,7 @@ async def handle_mop_care(request: web.Request) -> web.Response:
         _mop_care.update(phase="done", washed=True, dried=True, tries={},
                          note="désactivé")
     else:
-        _mop_care.update(phase="idle", washed=False, dried=False, tries={},
+        _mop_care.update(phase="idle", washed=False, dried=False, emptied=False, dust_skipped=False, dust_attempted=False, tries={},
                          note="")
     _care_cfg.update(enabled=want, armed_at=time.time())
     _care_cfg_save()
@@ -5504,8 +5540,8 @@ async def handle_resume(request: web.Request) -> web.Response:
 
         if plan["kind"] == "vacuum":
             # The robot still holds the job, so its own modes are already right.
-            result = await props.command.send(RoborockCommand.APP_START)
-            _LOGGER.info("resume: vacuum resume (app_start) forced=%s", force)
+            result = await _resume_loaded_job(props)
+            _LOGGER.info("resume: held job forced=%s", force)
             return web.json_response({"ok": True, "kind": "vacuum", "rooms": [], "modes": modes,
                                       "detail": "vacuum resume", "result": result})
 
