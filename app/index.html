@@ -1018,7 +1018,7 @@
   .roomquick::-webkit-scrollbar{ display:none; }
   /* Only where it means something: in zone and go-to modes the map is not
      taking room selections at all. */
-  .mapstage:not(.selectmode) .roomquick{ display:none; }
+  .roomquick:empty, .mapstage:not(.selectmode) .roomquick{ display:none; }
   .mapstage.loading .roomquick{ opacity:.4; pointer-events:none; }
   .rq{ flex:0 0 auto; width:56px; border:0; background:none; cursor:pointer;
        display:flex; flex-direction:column; align-items:center; gap:2px;
