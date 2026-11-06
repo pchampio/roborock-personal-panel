@@ -115,6 +115,12 @@ const state = {devices:[{duid:'demo',name:'Robot démo',model:'roborock.vacuum.a
   await page.waitForFunction(()=>document.getElementById('map').naturalWidth===800);
   await page.locator('#map').evaluate(img=>img.decode());
   await page.waitForFunction(()=>roomIdx&&getComputedStyle(document.getElementById('mapph')).display==='none');
+  if(process.argv.includes('--check-selection')){
+   await require('./check-room-selection.cjs')(page);
+   assert.deepEqual(errors,[]);
+   assert.deepEqual(posts,[], 'selection checks must not issue commands');
+   return;
+  }
   await page.locator('.preset[data-id="fast"]').click();
   await page.locator('.preset[data-id="bath"]').click();
   await page.mouse.move(0,0);

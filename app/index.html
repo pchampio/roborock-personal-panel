@@ -2377,6 +2377,7 @@ const selected=new Set();
    updateFab which reads it: as a `let` further down, any call reaching it before
    its own block ran would throw on the temporal dead zone. */
 let presetSel=new Set();
+const presetRoomExcluded=new Set(); // edits to this job only; saved presets stay intact
 let latest=null, mapMode="select", curTab="clean";
 
 function toast(m,err){ const t=$("toast"); $("toast_msg").textContent=m; t.classList.toggle("err",!!err); t.classList.add("show"); clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove("show"),2600); }
@@ -2458,13 +2459,37 @@ document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
 });
 
 /* rooms as chips */
-function toggleRoom(id){ selected.has(id)?selected.delete(id):selected.add(id); clearHover(); syncSel(); }
-function setHover(id){ if(mapMode!=="select"||selected.has(id)||id===hoverSeg)return; hoverSeg=id; drawHighlight(); }
+function roomPresetIds(p){
+  if(hasZones(p)) return [];
+  const b=p.body||{};
+  return ((b.segments||[]).length ? b.segments : (b.per_room||[]).map(r=>r.id)).map(Number);
+}
+function presetRoomIds(){ return new Set(presetSelList().flatMap(roomPresetIds)); }
+function selectedRoomIds(){
+  const rooms=new Set(selected);
+  for(const id of presetRoomIds()) if(!presetRoomExcluded.has(id)) rooms.add(id);
+  return rooms;
+}
+function extraSelectedRooms(){
+  const presetRooms=presetRoomIds();
+  return orderedSelection().filter(id=>!presetRooms.has(id));
+}
+function toggleRoom(id){
+  id=Number(id);
+  const inPreset=presetRoomIds().has(id);
+  if(selectedRoomIds().has(id)){
+    selected.delete(id);
+    if(inPreset) presetRoomExcluded.add(id);
+  }else if(inPreset) presetRoomExcluded.delete(id);
+  else selected.add(id);
+  clearHover(); syncSel();
+}
+function setHover(id){ if(mapMode!=="select"||selectedRoomIds().has(id)||id===hoverSeg)return; hoverSeg=id; drawHighlight(); }
 function clearHover(){ if(hoverSeg===null)return; hoverSeg=null; drawHighlight(); }
 function renderRooms(rooms){ const box=$("rooms"); if(!box) return;  // chip list removed: rooms are picked on the map
   if(!rooms||!rooms.length){box.textContent="No rooms mapped.";box.className="muted";return;}
   box.className="chips"; box.innerHTML="";
-  for(const rm of rooms){ const c=document.createElement("div"); c.className="roomchip"+(selected.has(rm.segment_id)?" on":"");
+  for(const rm of rooms){ const c=document.createElement("div"); c.className="roomchip"+(selectedRoomIds().has(Number(rm.segment_id))?" on":"");
     c.innerHTML=`${rm.name}<small>#${rm.segment_id}</small>`; c.dataset.seg=rm.segment_id;
     c.onclick=()=>toggleRoom(rm.segment_id); box.appendChild(c); } updateFab(); }
 /* --- AI obstacles ------------------------------------------------------ */
@@ -3442,7 +3467,7 @@ function renderRoomQuick(rooms){
   for(const rm of list){
     const b=document.createElement("button");
     b.type="button";
-    b.className="rq"+(selected.has(rm.segment_id)?" on":"");
+    b.className="rq"+(selectedRoomIds().has(Number(rm.segment_id))?" on":"");
     b.dataset.seg=rm.segment_id;
     const icon=roomTagIcon(rm);
     b.innerHTML=(icon?`<img src="${icon}" alt="">`:`<img alt="" hidden>`)+`<span></span>`;
@@ -3522,7 +3547,7 @@ function renderMarkers(ov){ const box=$("markers"); box.innerHTML="";
   for(const o of ov||[]){
     const rm=roomBySeg(o.segment_id), icon=rm?roomTagIcon(rm):null;
     const m=document.createElement("div");
-    m.className="marker"+(selected.has(o.segment_id)?" sel":"");
+    m.className="marker"+(selectedRoomIds().has(Number(o.segment_id))?" sel":"");
     m.style.left=o.left_pct+"%"; m.style.top=o.top_pct+"%"; m.dataset.seg=o.segment_id;
     // No artwork for this room's tag: the segment number still identifies it,
     // which beats an empty circle.
@@ -3754,7 +3779,7 @@ function showPresetPreview(p, veil){
   previewVeil=!!veil;
   if(!p) return;
   const body=p.body||{}, sm=p.summary||{};
-  previewSegs=new Set((body.segments||[]).map(Number).filter(Boolean));
+  previewSegs=new Set(((body.segments||[]).length ? body.segments : (body.per_room||[]).map(r=>r.id)).map(Number).filter(Boolean));
   // Zone rects are map-image pixels, so they only mean anything on the map they
   // were drawn on. On a different one they would point at the wrong floor, which
   // is worse than showing nothing -- runPreset warns about the same mismatch.
@@ -4214,9 +4239,10 @@ function drawHighlight(){
   // Preview first: while a preset is on screen it is the thing being described,
   // and a room that happens to be in your own selection too should still read as
   // part of the preset.
+  const rooms=previewVeil ? new Set() : selectedRoomIds();
   const shade=(seg)=> !seg ? 0
     : previewSegs.has(seg) ? HL_PRE
-    : selected.has(seg) ? HL_SEL
+    : rooms.has(seg) ? HL_SEL
     : seg===hoverSeg ? HL_HOV : 0;
   const out=g.createImageData(w,h), o=out.data;
   let any=false;
@@ -4252,9 +4278,11 @@ function drawHighlight(){
   }
   if(any) g.putImageData(out,0,0);
 }
-function syncSel(){
+function paintRoomSelection(){
+  const rooms=selectedRoomIds();
   document.querySelectorAll("#roomquick .rq").forEach(b=>
-    b.classList.toggle("on", selected.has(Number(b.dataset.seg))));
+    { const on=rooms.has(Number(b.dataset.seg));
+      b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); });
   // Same rule as the highlight canvas, and for the same reason: the room selection
   // belongs to select mode, so outside it nothing on the map should still be saying
   // which rooms are picked. drawHighlight bails out on exactly this test; the
@@ -4262,9 +4290,11 @@ function syncSel(){
   // `selected` itself is untouched -- coming back to select mode brings it back.
   const showSel = mapMode==="select" || previewActive();
   document.querySelectorAll("#markers .marker").forEach(m=>
-    m.classList.toggle("sel", showSel && selected.has(Number(m.dataset.seg))));
-  document.querySelectorAll("#rooms .roomchip").forEach(c=>c.classList.toggle("on",selected.has(Number(c.dataset.seg))));
-  drawHighlight(); updateFab();
+    m.classList.toggle("sel", showSel && rooms.has(Number(m.dataset.seg))));
+  document.querySelectorAll("#rooms .roomchip").forEach(c=>c.classList.toggle("on",rooms.has(Number(c.dataset.seg))));
+}
+function syncSel(){
+  paintRoomSelection(); drawHighlight(); updateFab();
   // With presets selected these rooms are part of that job, so the preview -- which
   // is what shows the whole job on the map -- has to be rebuilt with them in it.
   if(presetSel.size) syncPresetSel(); }
@@ -4343,7 +4373,7 @@ function syncCleanStartLabel(){
   const b=$("sheet_start"); if(!b) return;
   b.textContent = jobRunning() ? "Mettre en file" : "Nettoyer";
 }
-function updateFab(){ const n=selected.size; const sc=$("selcount"); if(sc) sc.textContent=n?`${n} selected`:"none selected";
+function updateFab(){ const n=extraSelectedRooms().length; const sc=$("selcount"); if(sc) sc.textContent=n?`${n} selected`:"none selected";
   syncScopeLabel();
   const b=$("fab_primary"), z=(typeof zoneList!=="undefined")?zoneList.length:0;
   // While it is cleaning, the button is not an invitation to configure anything --
@@ -4357,7 +4387,9 @@ function updateFab(){ const n=selected.size; const sc=$("selcount"); if(sc) sc.t
   // a spinner with the current room on it until something is picked, so the button
   // is not blank while there is nothing to queue.
   const picked=(mapMode==="zone" ? z : n) + presetSel.size;
-  b.disabled = busy && !picked;
+  const emptyPreset=presetSel.size && !selectionSources()?.length;
+  b.disabled = (busy && !picked) || !!emptyPreset;
+  if(emptyPreset){ b.textContent="Sélectionnez des pièces"; b.removeAttribute("title"); return; }
   if(busy && !picked){
             b.innerHTML='<i class="fabspin"></i><span></span>';
             b.querySelector("span").textContent=runningLabel();   // a room name is user text
@@ -4375,8 +4407,8 @@ function updateFab(){ const n=selected.size; const sc=$("selcount"); if(sc) sc.t
             return; }
   b.removeAttribute("title");
   // Stage 1: this only opens the settings sheet, so it must not say "Clean".
-  // A preset selection takes the button: it is the more specific request, and
-  // togglePresetSel has already cleared any room selection that was competing.
+  // A preset selection takes the button; manually added rooms are counted
+  // separately, without counting rooms already included by a preset twice.
   const ps=presetSel.size;
   // What selectionSources will actually take: zones always (they only exist in zone
   // mode), rooms only while they are on screen. Counting a hidden room selection
@@ -7337,7 +7369,11 @@ function presetSelList(){
   return [...presetSel].map(id=>by.get(id)).filter(Boolean);
 }
 function togglePresetSel(p){
-  if(presetSel.has(p.id)) presetSel.delete(p.id); else presetSel.add(p.id);
+  if(presetSel.has(p.id)) presetSel.delete(p.id);
+  else{
+    presetSel.add(p.id);
+    for(const id of roomPresetIds(p)) presetRoomExcluded.delete(id);
+  }
   // A room selection is no longer cleared: with a preset picked, rooms and zones
   // chosen on the map join the same job (see selectionSources).
   syncPresetSel();
@@ -7345,6 +7381,7 @@ function togglePresetSel(p){
 function clearPresetSel(){
   if(!presetSel.size) return;
   presetSel.clear();
+  presetRoomExcluded.clear();
   syncPresetSel();
 }
 /* Card state, the map, and the button, from the one source of truth. Also drops
@@ -7353,6 +7390,8 @@ function clearPresetSel(){
 function syncPresetSel(){
   const list=presetSelList();
   if(list.length!==presetSel.size) presetSel=new Set(list.map(p=>p.id));
+  const rooms=presetRoomIds();
+  for(const id of presetRoomExcluded) if(!rooms.has(id)) presetRoomExcluded.delete(id);
   document.querySelectorAll("#presets .preset").forEach(el=>{
     const on=presetSel.has(el.dataset.id);
     el.classList.toggle("on", on);
@@ -7364,13 +7403,15 @@ function syncPresetSel(){
   // sheet's own preview is the veiled one, so nothing is touched while it is up.
   if(!pvCur){
     const srcs=selectionSources();
-    if(srcs) showPresetPreview(mergePresets(srcs), false);
+    if(srcs?.length) showPresetPreview(mergePresets(srcs), false);
     else clearPresetPreview();
   }
+  paintRoomSelection();
   updateFab();
 }
 /* --- rooms and zones picked alongside a preset -------------------------
-   With presets selected, tapping a room or drawing a zone adds it to the same job.
+   Preset rooms can be toggled out of this job without changing the saved preset.
+   Additional rooms and drawn zones join the same job.
    Those targets have no settings of their own -- there is no sheet in that gesture
    to give them any -- so they take the settings this job mostly uses.
 
@@ -7400,23 +7441,33 @@ const EXTRA_SRC="Ajouts";
    selected on the map as one more source. Null when no preset is picked -- that is
    the plain map-selection flow, which has its own sheet and its own settings. */
 function selectionSources(){
-  const presets=presetSelList();
-  if(!presets.length) return null;
+  const originals=presetSelList();
+  if(!originals.length) return null;
+  const presets=originals.map(p=>{
+    const ids=roomPresetIds(p);
+    if(!ids.some(id=>presetRoomExcluded.has(id))) return p;
+    const segments=ids.filter(id=>!presetRoomExcluded.has(id));
+    if(!segments.length) return null; // never turn an empty room pick into a full clean
+    const body={...p.body, segments};
+    if(body.per_room) body.per_room=body.per_room.filter(r=>!presetRoomExcluded.has(Number(r.id)));
+    return {...p, id:null, merged:true, sources:[p], body};
+  }).filter(Boolean);
   // Only what the map is actually showing. A room selection survives a switch to
   // zone mode but stops being visible there, and something invisible must not be
   // added to a job -- zoneList needs no such test, swapZones puts it away.
   const rooms=(mapMode==="select")
-    ? ((typeof orderedSelection==="function") ? orderedSelection() : [...selected])
+    ? extraSelectedRooms()
     : [];
   const zones=(typeof zoneList!=="undefined") ? zoneList : [];
   if(!rooms.length && !zones.length) return presets;
-  const modes=meanModes(mergePresets(presets));
+  const modes=meanModes(mergePresets(presets.length ? presets : originals));
   const body={...modes};
   if(rooms.length) body.segments=rooms.slice();
   if(zones.length) body.zones=zones.map(z=>({rect:[z.x0,z.y0,z.x1,z.y1],
                                              repeat: z.repeat ?? modes.repeat ?? 1,
                                              ...(z.name?{name:z.name}:{})}));
   return [...presets, {id:null, name:EXTRA_SRC,
+                       ...(!presets.length ? {merged:true, sources:originals} : {}),
                        kind: rooms.length ? "segment" : "zone",
                        endpoint: rooms.length ? "/api/clean" : "/api/zone",
                        body,
@@ -8533,6 +8584,7 @@ $("sheet_save").onclick=async()=>{
 $("fab_primary").onclick=()=>{
   const sel=selectionSources();
   if(!sel) return openCleanSheet();
+  if(!sel.length) return;
   const why=mergeBlocker(sel);
   if(why){ toast(why,1); return; }
   openPresetSheet(mergePresets(sel));
