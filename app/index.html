@@ -2378,6 +2378,7 @@ const selected=new Set();
    its own block ran would throw on the temporal dead zone. */
 let presetSel=new Set();
 const presetRoomExcluded=new Set(); // edits to this job only; saved presets stay intact
+let presetSelectionEmptied=false;
 let latest=null, mapMode="select", curTab="clean";
 
 function toast(m,err){ const t=$("toast"); $("toast_msg").textContent=m; t.classList.toggle("err",!!err); t.classList.add("show"); clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove("show"),2600); }
@@ -2482,6 +2483,7 @@ function toggleRoom(id){
     if(inPreset) presetRoomExcluded.add(id);
   }else if(inPreset) presetRoomExcluded.delete(id);
   else selected.add(id);
+  if(selectedRoomIds().size) presetSelectionEmptied=false;
   clearHover(); syncSel();
 }
 function setHover(id){ if(mapMode!=="select"||selectedRoomIds().has(id)||id===hoverSeg)return; hoverSeg=id; drawHighlight(); }
@@ -4387,7 +4389,7 @@ function updateFab(){ const n=extraSelectedRooms().length; const sc=$("selcount"
   // a spinner with the current room on it until something is picked, so the button
   // is not blank while there is nothing to queue.
   const picked=(mapMode==="zone" ? z : n) + presetSel.size;
-  const emptyPreset=presetSel.size && !selectionSources()?.length;
+  const emptyPreset=(presetSelectionEmptied && !picked) || (presetSel.size && !selectionSources()?.length);
   b.disabled = (busy && !picked) || !!emptyPreset;
   if(emptyPreset){ b.textContent="Sélectionnez des pièces"; b.removeAttribute("title"); return; }
   if(busy && !picked){
@@ -7369,6 +7371,7 @@ function presetSelList(){
   return [...presetSel].map(id=>by.get(id)).filter(Boolean);
 }
 function togglePresetSel(p){
+  presetSelectionEmptied=false;
   if(presetSel.has(p.id)) presetSel.delete(p.id);
   else{
     presetSel.add(p.id);
@@ -7379,7 +7382,8 @@ function togglePresetSel(p){
   syncPresetSel();
 }
 function clearPresetSel(){
-  if(!presetSel.size) return;
+  if(!presetSel.size && !presetSelectionEmptied) return;
+  presetSelectionEmptied=false;
   presetSel.clear();
   presetRoomExcluded.clear();
   syncPresetSel();
@@ -7388,7 +7392,12 @@ function clearPresetSel(){
    ids whose preset has since been deleted -- otherwise the button would stay lit
    for a selection with nothing in it. */
 function syncPresetSel(){
-  const list=presetSelList();
+  const before=presetSelList();
+  const list=before.filter(p=>{
+    const rooms=roomPresetIds(p);
+    return !rooms.length || rooms.some(id=>!presetRoomExcluded.has(id));
+  });
+  if(before.length && !list.length) presetSelectionEmptied=true;
   if(list.length!==presetSel.size) presetSel=new Set(list.map(p=>p.id));
   const rooms=presetRoomIds();
   for(const id of presetRoomExcluded) if(!rooms.has(id)) presetRoomExcluded.delete(id);
@@ -8582,6 +8591,7 @@ $("sheet_save").onclick=async()=>{
   }catch(e){ toast("échec: "+e.message,1); }
 };
 $("fab_primary").onclick=()=>{
+  if($("fab_primary").disabled) return;
   const sel=selectionSources();
   if(!sel) return openCleanSheet();
   if(!sel.length) return;
